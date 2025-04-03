@@ -25,6 +25,9 @@
               "${pkgs.callPackage ./build.zig.zon.nix {}}"
             ];
             nativeBuildInputs = [pkgs.zig.hook];
+            meta = {
+              mainProgram = "ziggy";
+            };
           };
           default = config.packages.ziggy;
           update-deps = pkgs.writeShellApplication {
