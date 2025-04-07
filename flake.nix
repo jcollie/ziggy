@@ -34,12 +34,21 @@
             pkgs.stdenv.mkDerivation {
               name = "ziggy";
               version = "0.0.0";
+              outputs = [
+                "out"
+                "tree_sitter"
+              ];
               src = ./.;
+              nativeBuildInputs = [zig_hook];
               zigBuildFlags = [
                 "--system"
                 "${pkgs.callPackage ./build.zig.zon.nix {}}"
               ];
-              nativeBuildInputs = [zig_hook];
+              postInstall = ''
+                mkdir $tree_sitter
+                cp -R tree-sitter-ziggy $tree_sitter/ziggy
+                cp -R tree-sitter-ziggy-schema $tree_sitter/ziggy_schema
+              '';
               meta = {
                 mainProgram = "ziggy";
               };
