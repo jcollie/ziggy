@@ -2,10 +2,12 @@
 {
   lib,
   linkFarm,
+  fetchzip,
   fetchurl,
   fetchgit,
   runCommandLocal,
-  zig_0_14,
+  zig_0_16,
+  zstd,
   name ? "zig-packages",
 }:
 let
@@ -16,11 +18,14 @@ let
     }:
     runCommandLocal name
       {
-        nativeBuildInputs = [ zig_0_14 ];
+        nativeBuildInputs = [ zig_0_16 ];
       }
       ''
-        hash="$(zig fetch --global-cache-dir "$TMPDIR" ${artifact})"
-        mv "$TMPDIR/p/$hash" "$out"
+        # workaround https://codeberg.org/ziglang/zig/issues/31866
+        # https://github.com/Cloudef/zig2nix/issues/54
+        touch "$TMPDIR/build.zig"
+        hash="$(cd "$TMPDIR" && zig fetch --global-cache-dir "$TMPDIR" ${artifact})"
+        mv "$TMPDIR/p/$hash.tar.gz" "$out"
         chmod 755 "$out"
       '';
 
@@ -29,9 +34,17 @@ let
       name,
       url,
       hash,
+      unpack,
     }:
     let
-      artifact = fetchurl { inherit url hash; };
+      artifact =
+        if unpack then
+          fetchzip {
+            inherit url hash;
+            nativeBuildInputs = [ zstd ];
+          }
+        else
+          fetchurl { inherit url hash; };
     in
     unpackZigArtifact { inherit name artifact; };
 
@@ -47,10 +60,7 @@ let
       url_without_query = builtins.elemAt (lib.splitString "?" url_base) 0;
       rev_base = builtins.elemAt parts 1;
       rev =
-        if builtins.match "^[a-fA-F0-9]{40}$" rev_base != null then
-          rev_base
-        else
-          "refs/heads/${rev_base}";
+        if builtins.match "^[a-fA-F0-9]{40}$" rev_base != null then rev_base else "refs/heads/${rev_base}";
     in
     fetchgit {
       inherit name rev hash;
@@ -64,6 +74,7 @@ let
       name,
       url,
       hash,
+      unpack,
     }:
     let
       parts = lib.splitString "://" url;
@@ -79,11 +90,11 @@ let
           url = "https://${path}";
         };
         http = fetchZig {
-          inherit name hash;
+          inherit name hash unpack;
           url = "http://${path}";
         };
         https = fetchZig {
-          inherit name hash;
+          inherit name hash unpack;
           url = "https://${path}";
         };
       };
@@ -92,43 +103,21 @@ let
 in
 linkFarm name [
   {
-    name = "N-V-__8AABhrAQAQLLLGadghhPsdxTgBk9N9aLVOjXW3ay0V";
-    path = fetchZigArtifact {
-      name = "diffz";
-      url = "https://github.com/ziglibs/diffz/archive/ef45c00d655e5e40faf35afbbde81a1fa5ed7ffb.tar.gz";
-      hash = "sha256-Hdj0Z4Fxv9JHaqdHQ+SLzhCq0rkMLfA406xrDvN/w7o=";
-    };
-  }
-  {
-    name = "known_folders-0.0.0-Fy-PJtLDAADGDOwYwMkVydMSTp_aN-nfjCZw6qPQ2ECL";
+    name = "known_folders-0.0.0-Fy-PJk7KAAC41mQXzmFyGa0Q7tvmQjatENkREa6Gc4zu";
     path = fetchZigArtifact {
       name = "known_folders";
-      url = "git+https://github.com/ziglibs/known-folders#aa24df42183ad415d10bc0a33e6238c437fc0f59";
-      hash = "sha256-YiJ2lfG1xsGFMO6flk/BMhCqJ3kB3MnOX5fnfDEcmMY=";
+      url = "git+https://github.com/ziglibs/known-folders#175f5596b3d2ee3c658282bb07885580895a0e73";
+      hash = "sha256-gTnTyqkAAT5AYXxbG80ybiiRk+pOkm7dvqThcNWGmpo=";
+      unpack = true;
     };
   }
   {
-    name = "lsp_codegen-0.1.0-CMjjo0ZXCQB-rAhPYrlfzzpU0u0u2MeGvUucZ-_g32eg";
-    path = fetchZigArtifact {
-      name = "lsp_codegen";
-      url = "git+https://github.com/zigtools/zig-lsp-codegen#063a98c13a2293d8654086140813bdd1de6501bc";
-      hash = "sha256-KzRi/a3FCS11Mryin9skkf3rFrIuoMP8+RcU0IuYNBA=";
-    };
-  }
-  {
-    name = "lsp_kit-0.1.0-hAAxO8C9AADemCOc0CmRChs50IY82liZno5pFFN8HJs5";
+    name = "lsp_kit-0.1.0-bi_PL_kyDACVTEhLaMq2-PJx0MocqRyjXDAN0ybMUyQQ";
     path = fetchZigArtifact {
       name = "lsp_kit";
-      url = "git+https://github.com/kristoff-it/zig-lsp-kit#4e1d1b49261aea58e166a8d57382f32052584b74";
-      hash = "sha256-6n3KPnxSPNfPxUyQ+9USKGWM8zr3K3CyxyQurvTPOtU=";
-    };
-  }
-  {
-    name = "zig_yaml-0.1.0-C1161hVrAgDsyB2EZnq-Vp-QuZ9xJm2y0dECRXGG3UaP";
-    path = fetchZigArtifact {
-      name = "yaml";
-      url = "git+https://github.com/kubkon/zig-yaml#27f63d3d2d13ed228d8fc077635205e6c2a405c7";
-      hash = "sha256-aV2hIlcb5Y9h08H8JAWHy92YDK7rwT2PFBNwKsmSU0g=";
+      url = "git+https://github.com/zigtools/lsp-kit#ec325a3c33d1da7708cf513355208f74d9560580";
+      hash = "sha256-60F2BOCrl3CreQFmpH3HAz6zzxd3VgJ3iSEkP39gtgQ=";
+      unpack = true;
     };
   }
 ]
