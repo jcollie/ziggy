@@ -11,6 +11,15 @@ const log = std.log.scoped(.ziggy_lsp);
 
 pub const Language = enum { supermd, ziggy, ziggy_schema };
 
+/// A diagnostic's message as the client can take it: Markdown only when it
+/// said it supports that, since LSP 3.18 guards it behind
+/// `textDocument.diagnostic.markupMessageSupport` and a client that did not
+/// ask for it (Helix, for one) fails to parse the whole notification.
+fn diagnosticMessage(self: *const Handler, msg: []const u8) @FieldType(lsp.types.Diagnostic, "message") {
+    if (self.markup_diagnostics) return .{ .markup_content = .{ .kind = .markdown, .value = msg } };
+    return .{ .string = msg };
+}
+
 pub fn loadFile(
     self: *Handler,
     arena: std.mem.Allocator,
@@ -54,12 +63,7 @@ pub fn loadFile(
                                 .character = sel.end.col - 1,
                             },
                         },
-                        .message = .{
-                            .markup_content = .{
-                                .kind = .markdown,
-                                .value = msg,
-                            },
-                        },
+                        .message = diagnosticMessage(self, msg),
                     };
                 }
 
@@ -105,12 +109,7 @@ pub fn loadFile(
                                 },
                             },
                             .severity = .Error,
-                            .message = .{
-                                .markup_content = .{
-                                    .kind = .markdown,
-                                    .value = msg,
-                                },
-                            },
+                            .message = diagnosticMessage(self, msg),
                         };
                     }
 
@@ -176,12 +175,7 @@ pub fn loadFile(
                         .wrong_field_style, .wrong_field_separator => .Information,
                         else => .Error,
                     },
-                    .message = .{
-                        .markup_content = .{
-                            .kind = .markdown,
-                            .value = msg,
-                        },
-                    },
+                    .message = diagnosticMessage(self, msg),
                 };
             }
 
@@ -200,12 +194,7 @@ pub fn loadFile(
                         },
                     },
                     .severity = .Error,
-                    .message = .{
-                        .markup_content = .{
-                            .kind = .markdown,
-                            .value = msg,
-                        },
-                    },
+                    .message = diagnosticMessage(self, msg),
                 };
             }
 

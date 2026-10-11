@@ -49,6 +49,8 @@ docs: std.StringArrayHashMapUnmanaged(Document) = .{},
 schemas: std.StringHashMapUnmanaged(Schema) = .{},
 
 offset_encoding: offsets.Encoding = .@"utf-16",
+/// Whether the client takes Markdown in diagnostic messages.
+markup_diagnostics: bool = false,
 
 fn deinit(self: *Handler) void {
     _ = self;
@@ -87,6 +89,12 @@ pub fn initialize(
                 .custom_value => break,
             };
             break;
+        }
+    }
+
+    if (request.capabilities.textDocument) |text_document| {
+        if (text_document.diagnostic) |diagnostic| {
+            self.markup_diagnostics = diagnostic.markupMessageSupport orelse false;
         }
     }
 
