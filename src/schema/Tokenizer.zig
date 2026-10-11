@@ -1,7 +1,13 @@
 const Tokenizer = @This();
 const std = @import("std");
 
-idx: u32 = 0,
+idx: u32,
+
+pub const init: Tokenizer = .{ .idx = 0 };
+
+pub fn initFrom(src_idx: u32) Tokenizer {
+    return .{ .idx = src_idx };
+}
 
 pub const Token = struct {
     tag: Tag,
@@ -37,21 +43,20 @@ pub const Token = struct {
 
         pub fn isExpr(t: Token.Tag) bool {
             return switch (t) {
-                .qmark,
-                .slice_sigil,
-                .dict_sigil,
-                .bytes_kw,
-                .int_kw,
-                .float_kw,
-                .bool_kw,
                 .any_kw,
-                .identifier,
-                .opt_int_kw,
-                .opt_float_kw,
-                .opt_slice_sigil,
-                .opt_dict_sigil,
-                .opt_bytes_kw,
+                .bool_kw,
                 .opt_bool_kw,
+                .int_kw,
+                .opt_int_kw,
+                .float_kw,
+                .opt_float_kw,
+                .bytes_kw,
+                .opt_bytes_kw,
+                .slice_sigil,
+                .opt_slice_sigil,
+                .dict_sigil,
+                .opt_dict_sigil,
+                .identifier,
                 .opt_identifier,
                 => true,
                 else => false,
@@ -263,7 +268,7 @@ pub fn next(t: *Tokenizer, src: [:0]const u8) Token {
                 return tok;
             },
             '{' => {
-                if (std.mem.eql(u8, src[t.idx .. t.idx + 3], "{:}")) {
+                if (std.mem.startsWith(u8, src[t.idx..], "{:}")) {
                     t.idx += 3;
                     tok.tag = .opt_dict_sigil;
                     tok.loc.end = t.idx;
@@ -393,7 +398,7 @@ test "basics" {
     };
     // zig fmt: on
 
-    var t: Tokenizer = .{};
+    var t: Tokenizer = .init;
 
     for (expected, 0..) |e, idx| {
         errdefer std.debug.print("failed at index: {}\n", .{idx});
@@ -474,7 +479,7 @@ test "more" {
     };
     // zig fmt: on
 
-    var t: Tokenizer = .{};
+    var t: Tokenizer = .init;
 
     for (expected, 0..) |e, idx| {
         errdefer std.debug.print("failed at index: {} \n---\n{s}\n---\n", .{ idx, case[t.idx..] });
@@ -517,7 +522,7 @@ test "sigil errors" {
     };
     // zig fmt: on
 
-    var t: Tokenizer = .{};
+    var t: Tokenizer = .init;
 
     for (expected, 0..) |e, idx| {
         errdefer std.debug.print("failed at index: {} \n---\n{s}\n---\n", .{ idx, case[t.idx..] });

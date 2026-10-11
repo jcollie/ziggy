@@ -188,12 +188,12 @@ fn formatFileFallible(
     const stdout = &stdout_writer.interface;
 
     if (check) any_error.store(true, .unordered) else {
-        var af = try Io.Dir.cwd().createFileAtomic(io, full_path, .{});
+        var af = try Io.Dir.cwd().createFileAtomic(io, full_path, .{ .replace = true });
         defer af.deinit(io);
 
         var writer = af.file.writer(io, &.{});
         try writer.interface.writeAll(out_bytes);
-        try af.link(io);
+        try af.replace(io);
     }
 
     _ = std.debug.lockStderr(&.{});
@@ -236,7 +236,7 @@ pub fn fmtSuperMD(
 
     if (ast.has_syntax_errors) return error.Syntax;
 
-    return std.fmt.allocPrint(gpa, "{f}\n", .{ast.fmt(src)});
+    return std.fmt.allocPrint(gpa, "{f}\n", .{ast.fmt(src, .plain)});
 }
 
 pub fn fmtZiggy(
@@ -250,6 +250,7 @@ pub fn fmtZiggy(
     if (ast.errors.len > 0) {
         _ = std.debug.lockStderr(&.{});
         for (ast.errors) |err| {
+            if (err.tag == .wrong_field_style) continue;
             const sel = err.main_location.getSelection(src);
             std.debug.print("{s}:{}:{} {f}\n", .{
                 path orelse "<stdin>",
@@ -263,7 +264,7 @@ pub fn fmtZiggy(
 
     if (ast.has_syntax_errors) return error.Syntax;
 
-    return std.fmt.allocPrint(gpa, "{f}\n", .{ast.fmt(src)});
+    return std.fmt.allocPrint(gpa, "{f}\n", .{ast.fmt(src, .plain)});
 }
 
 fn fmtSchema(
@@ -411,19 +412,19 @@ pub const Command = struct {
             \\
             \\Formats input paths inplace. If PATH is a directory, it will
             \\be searched recursively for Ziggy and Ziggy Schema files.
-            \\     
-            \\Detected extensions:     
-            \\     Ziggy         .ziggy  
-            \\     Ziggy Schema  .ziggy-schema 
-            \\     SuperMD       .supermd  
+            \\
+            \\Detected extensions:
+            \\     Ziggy         .ziggy
+            \\     Ziggy Schema  .ziggy-schema
+            \\     SuperMD       .smd
             \\
             \\NOTE: SuperMD support is temporary until a dedicated
             \\      CLI tool is created.
             \\
             \\Options:
             \\
-            \\--stdin            Format bytes from stdin and ouptut to stdout. 
-            \\                   Mutually exclusive with other input aguments.    
+            \\--stdin            Format bytes from stdin and output to stdout.
+            \\                   Mutually exclusive with other input arguments.
             \\
             \\--stdin-schema     Same as --stdin but for Ziggy Schema files.
             \\
@@ -443,7 +444,7 @@ pub const Command = struct {
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print("fatal error: " ++ fmt ++ "\n", args);
-    if (builtin.mode == .Debug) @breakpoint();
+    if (builtin.mode == .debug) @breakpoint();
     std.process.exit(1);
 }
 

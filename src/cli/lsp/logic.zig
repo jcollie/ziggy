@@ -14,18 +14,18 @@ pub const Language = enum { supermd, ziggy, ziggy_schema };
 pub fn loadFile(
     self: *Handler,
     arena: std.mem.Allocator,
-    new_text: [:0]const u8,
+    new_text: [:0]u8,
     uri: []const u8,
     language: Language,
 ) !void {
     switch (language) {
         .ziggy_schema => {
             var schema = Schema.init(self.gpa, new_text, true);
-            errdefer schema.deinit(self.gpa);
+            errdefer schema.deinit(self.gpa, false);
 
             const gop = try self.schemas.getOrPut(self.gpa, uri);
             if (gop.found_existing) {
-                gop.value_ptr.deinit(self.gpa);
+                gop.value_ptr.deinit(self.gpa, true);
                 gop.value_ptr.src = schema.src;
                 gop.value_ptr.ast = schema.ast;
             } else {
@@ -54,7 +54,12 @@ pub fn loadFile(
                                 .character = sel.end.col - 1,
                             },
                         },
-                        .message = msg,
+                        .message = .{
+                            .markup_content = .{
+                                .kind = .markdown,
+                                .value = msg,
+                            },
+                        },
                     };
                 }
 
@@ -100,7 +105,12 @@ pub fn loadFile(
                                 },
                             },
                             .severity = .Error,
-                            .message = msg,
+                            .message = .{
+                                .markup_content = .{
+                                    .kind = .markdown,
+                                    .value = msg,
+                                },
+                            },
                         };
                     }
 
@@ -119,7 +129,7 @@ pub fn loadFile(
             const doc = try Document.init(self.gpa, language, new_text);
             const gop = try self.docs.getOrPut(self.gpa, uri);
             if (gop.found_existing) {
-                gop.value_ptr.deinit(self.gpa);
+                gop.value_ptr.deinit(self.gpa, true);
                 gop.value_ptr.src = doc.src;
                 gop.value_ptr.ast = doc.ast;
             } else {
@@ -133,7 +143,7 @@ pub fn loadFile(
                     break :blk &.{};
                 }
                 break :blk try schema.ast.validate(arena, schema.src, doc.ast, doc.src);
-            } else if (try schemaForZiggy(self, arena, uri)) |ms| blk: {
+            } else if (try schemaForDoc(self, arena, uri, language)) |ms| blk: {
                 assert(gop.value_ptr.schema_uri == null);
                 const schema_uri, const schema = ms;
                 gop.value_ptr.schema_uri = schema_uri;
@@ -146,7 +156,7 @@ pub fn loadFile(
                 break :blk try ziggy.schema.Ast.validateDefault(arena, doc.ast, doc.src);
             };
 
-            log.debug("sending {}  errors", .{doc.ast.errors.len + validation_errors.len});
+            log.debug("sending {} errors", .{doc.ast.errors.len + validation_errors.len});
             const diags = try arena.alloc(lsp.types.Diagnostic, doc.ast.errors.len + validation_errors.len);
             for (doc.ast.errors, diags[0..doc.ast.errors.len]) |err, *d| {
                 const msg = try std.fmt.allocPrint(arena, "{f}", .{err.tag});
@@ -166,7 +176,12 @@ pub fn loadFile(
                         .wrong_field_style, .wrong_field_separator => .Information,
                         else => .Error,
                     },
-                    .message = msg,
+                    .message = .{
+                        .markup_content = .{
+                            .kind = .markdown,
+                            .value = msg,
+                        },
+                    },
                 };
             }
 
@@ -185,7 +200,12 @@ pub fn loadFile(
                         },
                     },
                     .severity = .Error,
-                    .message = msg,
+                    .message = .{
+                        .markup_content = .{
+                            .kind = .markdown,
+                            .value = msg,
+                        },
+                    },
                 };
             }
 
@@ -202,62 +222,141 @@ pub fn loadFile(
     }
 }
 
-pub fn schemaForZiggy(
+pub fn schemaForDoc(
     self: *Handler,
     arena: std.mem.Allocator,
     uri_doc: []const u8,
+    language: Language,
 ) error{OutOfMemory}!?struct { []const u8, Schema } {
-    const uri_schema = try std.fmt.allocPrint(arena, "{s}-schema", .{uri_doc});
-    log.debug("trying to find schema at '{s}'", .{uri_schema});
 
-    if (self.schemas.getEntry(uri_schema)) |kv| {
-        kv.value_ptr.refs += 1;
-        return .{ kv.key_ptr.*, kv.value_ptr.* };
-    } else blk: {
-        const path = switch (builtin.target.os.tag) {
-            .wasi => uri_schema["file:///".len..],
-            else => uri_schema["file://".len..],
+    // foo.ziggy-schema
+    // foo.smd.ziggy-schema
+    {
+        const uri_schema = switch (language) {
+            else => unreachable,
+            .supermd => try std.fmt.allocPrint(arena, "{s}.ziggy-schema", .{uri_doc}),
+            .ziggy => try std.fmt.allocPrint(arena, "{s}-schema", .{uri_doc}),
         };
 
-        const src = self.dir.readFileAllocOptions(
-            self.io,
-            path,
-            self.gpa,
-            .limited(ziggy.max_size),
-            .of(u8),
-            0,
-        ) catch |err| {
-            switch (err) {
-                error.FileNotFound => {},
-                else => log.err(
-                    "unable to open '{s}' as a ziggy schema for '{s}': {t}",
-                    .{ uri_schema, uri_doc, err },
-                ),
-            }
-            break :blk;
+        if (self.schemas.getEntry(uri_schema)) |kv| {
+            kv.value_ptr.refs += 1;
+            return .{ kv.key_ptr.*, kv.value_ptr.* };
+        } else blk: {
+            const path = switch (builtin.target.os.tag) {
+                .wasi => uri_schema["file:///".len..],
+                else => uri_schema["file://".len..],
+            };
+
+            log.debug("trying to find schema at '{s}' [{s}]", .{ uri_schema, path });
+            const src = self.dir.readFileAllocOptions(
+                self.io,
+                path,
+                self.gpa,
+                .limited(ziggy.max_size),
+                .of(u8),
+                0,
+            ) catch |err| {
+                switch (err) {
+                    error.FileNotFound => {},
+                    else => log.err(
+                        "unable to open '{s}' as a ziggy schema for '{s}': {t}",
+                        .{ uri_schema, uri_doc, err },
+                    ),
+                }
+                break :blk;
+            };
+
+            var schema = Schema.init(self.gpa, src, false);
+            schema.refs = 1;
+            errdefer schema.deinit(self.gpa, false);
+            const gpa_schema_uri = try self.gpa.dupe(u8, uri_schema);
+            errdefer self.gpa.free(gpa_schema_uri);
+            try self.schemas.putNoClobber(
+                self.gpa,
+                gpa_schema_uri,
+                schema,
+            );
+            return .{ gpa_schema_uri, schema };
+        }
+    }
+
+    // .foo.ziggy-schema
+    // .foo.smd.ziggy-schema
+    {
+        const uri_schema = switch (language) {
+            else => unreachable,
+            .supermd => try std.fmt.allocPrint(arena, "{s}{c}.{s}.ziggy-schema", .{
+                std.fs.path.dirname(uri_doc) orelse "",
+                std.fs.path.sep,
+                std.fs.path.basename(uri_doc),
+            }),
+            .ziggy => try std.fmt.allocPrint(arena, "{s}{c}.{s}-schema", .{
+                std.fs.path.dirname(uri_doc) orelse "",
+                std.fs.path.sep,
+                std.fs.path.basename(uri_doc),
+            }),
         };
 
-        var schema = Schema.init(self.gpa, src, false);
-        schema.refs = 1;
-        errdefer schema.deinit(self.gpa);
-        const gpa_schema_uri = try self.gpa.dupe(u8, uri_schema);
-        errdefer self.gpa.free(gpa_schema_uri);
-        try self.schemas.putNoClobber(
-            self.gpa,
-            gpa_schema_uri,
-            schema,
-        );
-        return .{ gpa_schema_uri, schema };
+        if (self.schemas.getEntry(uri_schema)) |kv| {
+            kv.value_ptr.refs += 1;
+            return .{ kv.key_ptr.*, kv.value_ptr.* };
+        } else blk: {
+            const path = switch (builtin.target.os.tag) {
+                .wasi => uri_schema["file:///".len..],
+                else => uri_schema["file://".len..],
+            };
+
+            log.debug("trying to find schema at '{s}' [{s}]", .{ uri_schema, path });
+            const src = self.dir.readFileAllocOptions(
+                self.io,
+                path,
+                self.gpa,
+                .limited(ziggy.max_size),
+                .of(u8),
+                0,
+            ) catch |err| {
+                switch (err) {
+                    error.FileNotFound => {},
+                    else => log.err(
+                        "unable to open '{s}' as a ziggy schema for '{s}': {t}",
+                        .{ uri_schema, uri_doc, err },
+                    ),
+                }
+                break :blk;
+            };
+
+            var schema = Schema.init(self.gpa, src, false);
+            schema.refs = 1;
+            errdefer schema.deinit(self.gpa, false);
+            const gpa_schema_uri = try self.gpa.dupe(u8, uri_schema);
+            errdefer self.gpa.free(gpa_schema_uri);
+            try self.schemas.putNoClobber(
+                self.gpa,
+                gpa_schema_uri,
+                schema,
+            );
+            return .{ gpa_schema_uri, schema };
+        }
     }
 
     // .ziggy-schema search
-    var path_dir: []const u8 = uri_schema["file://".len..];
+    // .smd.ziggy-schema search
+    var path_dir: []const u8 = uri_doc["file://".len..];
     while (true) {
         path_dir = std.fs.path.dirname(path_dir) orelse return null;
         const dot_schema_uri = try std.fmt.allocPrint(
             arena,
             "file://{f}",
-            .{std.fs.path.fmtJoin(&.{ path_dir, ".ziggy-schema" })},
+            .{
+                std.fs.path.fmtJoin(&.{
+                    path_dir,
+                    switch (language) {
+                        else => unreachable,
+                        .ziggy => ".ziggy-schema",
+                        .supermd => ".smd.ziggy-schema",
+                    },
+                }),
+            },
         );
         const dot_schema_path = dot_schema_uri["file://".len..];
         if (self.schemas.getEntry(dot_schema_uri)) |kv| {
@@ -270,6 +369,8 @@ pub fn schemaForZiggy(
             .wasi => dot_schema_path["/".len..],
             else => dot_schema_path,
         };
+
+        log.debug("trying to find dot schema at [{s}]", .{path});
         const schema_src = self.dir.readFileAllocOptions(
             self.io,
             path,
@@ -287,7 +388,7 @@ pub fn schemaForZiggy(
 
         var schema = Schema.init(self.gpa, schema_src, false);
         schema.refs = 1;
-        errdefer schema.deinit(self.gpa);
+        errdefer schema.deinit(self.gpa, false);
         const gpa_dot_schema_uri = try self.gpa.dupe(u8, dot_schema_uri);
         try self.schemas.putNoClobber(
             self.gpa,

@@ -1,8 +1,55 @@
 const std = @import("std");
 const zon = @import("build.zig.zon");
+const afl = @import("afl_kit");
 
 /// The full Ziggy parsing functionality is available at build time.
 pub const ziggy = @import("src/root.zig");
+
+/// Validates user-provided types against a Ziggy Schema.
+///
+/// All public top-level declarations present in the root
+/// source file of the provided 'types' module will be
+/// matched by name witch corresponding type definitions
+/// in the provided Ziggy Schema.
+///
+/// You can add any other module import to your module, which
+/// means that you can just re-export your type definitions in
+/// the root source file of `types`.
+///
+/// If your Zig type name does not match the corresponding
+/// Ziggy Schema type name, make sure to use a public
+/// re-export that does:
+///
+///     pub const SchemaTypeNameA = MyZigTypeName;
+///
+/// See `ziggy.Options` for more information on how to
+/// customize (de)serialization for a Zig type.
+pub fn addTypeCheckStep(
+    /// Your `*std.Build` instance.
+    project: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.OptimizeMode,
+    /// A module that exposes your type definitions.
+    types: *std.Build.Module,
+    /// Path to the schema file
+    schema_path: std.Build.LazyPath,
+) *std.Build.Step {
+    const ziggy_dep = project.dependencyFromBuildZig(@This(), .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ziggy_b = ziggy_dep.builder;
+    return &addTypeCheckStepInternal(
+        project,
+        target,
+        optimize,
+        ziggy_b.path("build/type-checker.zig"),
+        ziggy_dep.module("ziggy"),
+        types,
+        schema_path,
+        false,
+    ).step;
+}
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -21,21 +68,17 @@ pub fn build(b: *std.Build) !void {
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
 
-    const ziggy_module = b.addModule("ziggy", .{
+    const ziggy_mod = b.addModule("ziggy", .{
         .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
         .strip = false,
     });
 
-    const folders = b.dependency("known_folders", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("known-folders");
-    const lsp = b.dependency("lsp_kit", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("lsp");
+    const ansi_term = b.dependency("ansi_term", .{});
+    const ansi_mod = ansi_term.module("ansi_term");
+    ziggy_mod.addImport("ansi_term", ansi_mod);
+
+    const folders = b.dependency("known_folders", .{}).module("known-folders");
+    const lsp = b.dependency("lsp_kit", .{}).module("lsp");
     // const yaml = b.dependency("yaml", .{
     //     .target = target,
     //     .optimize = optimize,
@@ -47,7 +90,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .single_threaded = single_threaded,
         .imports = &.{
-            .{ .name = "ziggy", .module = ziggy_module },
+            .{ .name = "ziggy", .module = ziggy_mod },
             .{ .name = "known-folders", .module = folders },
             .{ .name = "lsp", .module = lsp },
             // .{ .name = "yaml", .module = yaml },
@@ -62,7 +105,7 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(cli_exe);
 
     const run_exe = b.addRunArtifact(cli_exe);
-    if (b.args) |args| run_exe.addArgs(args);
+    run_exe.addPassthruArgs();
     const run_exe_step = b.step("run", "Run the Ziggy tool");
     run_exe_step.dependOn(&run_exe.step);
 
@@ -74,14 +117,15 @@ pub fn build(b: *std.Build) !void {
     const check = b.step("check", "Check if the project compiles");
     check.dependOn(&ziggy_check.step);
 
-    try setupTests(b, target, optimize, ziggy_module, cli_exe);
-    setupWasmStep(b, optimize, options, ziggy_module, lsp);
+    const test_step = try setupTestStep(b, target, optimize, ansi_mod, cli_exe);
+    setupFuzzStep(b, target, test_step, ziggy_mod);
+    setupWasmStep(b, optimize, options, ziggy_mod, lsp);
 
     const release = b.step("release", "Create release builds of Ziggy");
     const git_version = getGitVersion(b);
     if (git_version == .tag) {
         if (std.mem.eql(u8, version, git_version.tag[1..])) {
-            setupReleaseStep(b, ziggy_module, options, release);
+            setupReleaseStep(b, ziggy_mod, options, release);
         } else {
             release.dependOn(&b.addFail(b.fmt(
                 "error: git tag does not match zon package version (zon: '{s}', git: '{s}')",
@@ -268,25 +312,28 @@ pub fn setupReleaseStep(
     }
 }
 
-pub fn setupTests(
+pub fn setupTestStep(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    ziggy_module: *std.Build.Module,
+    ansi_mod: *std.Build.Module,
     cli_exe: *std.Build.Step.Compile,
-) !void {
+) !*std.Build.Step {
     const test_step = b.step("test", "Run unit & snapshot tests");
 
+    const ziggy_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ziggy_mod.addImport("ansi_term", ansi_mod);
+
     const unit_tests = b.addTest(.{
-        .root_module = ziggy_module,
-        .filters = b.args orelse &.{},
+        .root_module = ziggy_mod,
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
-    // if (b.args) |args| run_unit_tests.addArgs(args);
     test_step.dependOn(&run_unit_tests.step);
-
-    if (true) return;
 
     const diff = b.addSystemCommand(&.{
         "git",
@@ -306,22 +353,22 @@ pub fn setupTests(
     git_add.setName("git add tests/");
     diff.step.dependOn(&git_add.step);
 
-    b.build_root.handle.access("tests/ziggy", .{}) catch {
+    b.root.root_dir.handle.access(b.graph.io, "tests/ziggy", .{}) catch {
         const fail = b.addFail("snapshot test folder is missing, can't run tests (note: snapshot tests are not included in the ziggy manifest)");
         git_add.step.dependOn(&fail.step);
-        return;
+        return test_step;
     };
 
     // errors - ast
     {
         const base_path = b.pathJoin(&.{ "tests", "ziggy", "ast", "errors" });
-        var tests_dir = try b.build_root.handle.openDir(base_path, .{
+        var tests_dir = try b.root.root_dir.handle.openDir(b.graph.io, base_path, .{
             .iterate = true,
         });
-        defer tests_dir.close();
+        defer tests_dir.close(b.graph.io);
 
         var it = tests_dir.iterateAssumeFirstIteration();
-        while (try it.next()) |entry| {
+        while (try it.next(b.graph.io)) |entry| {
             if (entry.kind == .directory) continue;
             if (entry.name[0] == '.') continue;
             const ext = std.fs.path.extension(entry.name);
@@ -334,7 +381,7 @@ pub fn setupTests(
             run_cli.addFileInput(b.path(base_path).path(b, entry.name));
             run_cli.expectExitCode(1);
 
-            const out = run_cli.captureStdErr();
+            const out = run_cli.captureStdErr(.{});
             const snap_name = b.fmt("{s}_snap.txt", .{
                 std.fs.path.stem(entry.name),
             });
@@ -352,12 +399,12 @@ pub fn setupTests(
     // errors - type driven
     {
         const base_path = b.pathJoin(&.{ "tests", "ziggy", "type-driven", "errors" });
-        const tests_dir = try b.build_root.handle.openDir(base_path, .{
+        const tests_dir = try b.root.root_dir.handle.openDir(b.graph.io, base_path, .{
             .iterate = true,
         });
 
         var it = tests_dir.iterateAssumeFirstIteration();
-        while (try it.next()) |entry| {
+        while (try it.next(b.graph.io)) |entry| {
             if (entry.kind == .directory) continue;
             if (entry.name[0] == '.') continue;
             const ext = std.fs.path.extension(entry.name);
@@ -382,13 +429,13 @@ pub fn setupTests(
                 })),
             });
             test_program.root_module.addImport("test_type", type_module);
-            test_program.root_module.addImport("ziggy", ziggy_module);
+            test_program.root_module.addImport("ziggy", ziggy_mod);
 
             const run_cli = b.addRunArtifact(test_program);
             run_cli.addFileArg(b.path(b.pathJoin(&.{ base_path, entry.name })));
             run_cli.expectExitCode(1);
 
-            const out = run_cli.captureStdErr();
+            const out = run_cli.captureStdErr(.{});
             const snap_name = b.fmt("{s}_snap.txt", .{
                 std.fs.path.stem(entry.name),
             });
@@ -402,8 +449,119 @@ pub fn setupTests(
             git_add.step.dependOn(&update_snap.step);
         }
     }
+
+    // schema - type checker
+    {
+        const base_path = b.pathJoin(&.{ "tests", "schema", "type-checker" });
+        const tests_dir = try b.root.root_dir.handle.openDir(b.graph.io, base_path, .{
+            .iterate = true,
+        });
+
+        var it = tests_dir.iterateAssumeFirstIteration();
+        while (try it.next(b.graph.io)) |entry| {
+            if (entry.kind != .directory) continue;
+            const basename = std.fs.path.stem(entry.name);
+            const types = b.createModule(.{
+                .root_source_file = b.path(b.pathJoin(&.{
+                    base_path,
+                    basename,
+                    "root.zig",
+                })),
+            });
+
+            types.addImport("ziggy", ziggy_mod);
+
+            const check = addTypeCheckStepInternal(
+                b,
+                target,
+                optimize,
+                b.path("build/type-checker.zig"),
+                ziggy_mod,
+                types,
+                b.path(b.pathJoin(&.{
+                    base_path,
+                    basename,
+                    "root.ziggy-schema",
+                })),
+                true,
+            );
+
+            check.expectExitCode(1);
+
+            const out = check.captureStdErr(.{});
+
+            const update_snap = b.addUpdateSourceFiles();
+            update_snap.addCopyFileToSource(out, b.pathJoin(&.{
+                base_path,
+                basename,
+                "snapshot.txt",
+            }));
+
+            git_add.step.dependOn(&update_snap.step);
+        }
+    }
+
+    return test_step;
 }
 
+pub fn setupFuzzStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    test_step: *std.Build.Step,
+    ziggy_module: *std.Build.Module,
+) void {
+    if (!(b.option(bool, "fuzz", "enable fuzzing") orelse false)) {
+        return;
+    }
+
+    const afl_obj = b.addObject(.{
+        .name = "fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz/afl.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .single_threaded = true,
+        }),
+    });
+
+    afl_obj.root_module.addImport("ziggy", ziggy_module);
+
+    // Required options:
+    afl_obj.root_module.stack_check = false; // not linking with compiler-rt
+    afl_obj.root_module.link_libc = true; // afl runtime depends on libc
+    afl_obj.root_module.fuzz = true;
+    afl_obj.sanitize_coverage_trace_pc_guard = true;
+
+    // Generate an instrumented executable:
+    const afl_fuzz = afl.addInstrumentedExe(b, target, .ReleaseSafe, null, true, afl_obj, &.{});
+
+    // Install it
+    test_step.dependOn(&b.addInstallBinFile(afl_fuzz orelse return, "fuzz").step);
+
+    const repro = b.addExecutable(.{
+        .name = "fuzz-repro",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz/afl-repro.zig"),
+            .target = target,
+            .optimize = .debug,
+            .single_threaded = true,
+        }),
+    });
+    repro.root_module.addImport("ziggy", ziggy_module);
+    test_step.dependOn(&b.addInstallArtifact(repro, .{}).step);
+
+    const smith_repro = b.addExecutable(.{
+        .name = "fuzz-repro-smith",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz/afl-repro-smith.zig"),
+            .target = target,
+            .optimize = .debug,
+            .single_threaded = true,
+        }),
+    });
+    smith_repro.root_module.addImport("ziggy", ziggy_module);
+    test_step.dependOn(&b.addInstallArtifact(smith_repro, .{}).step);
+}
 const Version = union(Kind) {
     tag: []const u8,
     commit: []const u8,
@@ -420,14 +578,14 @@ const Version = union(Kind) {
     }
 };
 fn getGitVersion(b: *std.Build) Version {
-    const git_path = b.findProgram(&.{"git"}, &.{}) catch return .unknown;
+    const git_path = b.findProgram(.{ .names = &.{"git"} }) orelse return .unknown;
     var out: u8 = undefined;
     const git_describe = std.mem.trim(
         u8,
         b.runAllowFail(&[_][]const u8{
-            git_path,            "-C",
-            b.build_root.path.?, "describe",
-            "--match",           "*.*.*",
+            git_path,               "-C",
+            b.root.root_dir.path.?, "describe",
+            "--match",              "*.*.*",
             "--tags",
         }, &out, .ignore) catch return .unknown,
         " \n\r",
@@ -463,4 +621,39 @@ fn getGitVersion(b: *std.Build) Version {
             .{git_describe},
         ),
     }
+}
+
+fn addTypeCheckStepInternal(
+    project: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.OptimizeMode,
+    root_source_file: std.Build.LazyPath,
+    ziggy_mod: *std.Build.Module,
+    types: *std.Build.Module,
+    schema_path: std.Build.LazyPath,
+    comptime test_mode_enabled: bool,
+) *std.Build.Step.Run {
+    const check = project.addExecutable(.{
+        .name = "type_checker",
+        .root_module = project.createModule(.{
+            .root_source_file = root_source_file,
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    check.root_module.addImport("types", types);
+    check.root_module.addImport("ziggy", ziggy_mod);
+
+    const test_mode = project.addOptions();
+    test_mode.addOption(bool, "enabled", test_mode_enabled);
+    check.root_module.addOptions("test_mode", test_mode);
+
+    const run = project.addRunArtifact(check);
+    run.addFileArg(schema_path);
+    if (project.root.root_dir.path) |root_path| {
+        run.addArg(root_path);
+    }
+
+    return run;
 }

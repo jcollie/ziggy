@@ -1,23 +1,32 @@
 .{
     .name = .ziggy,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0x7d935ea7bf3c3891,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.2319+7cef4755c",
     .dependencies = .{
         .known_folders = .{
-            .url = "git+https://github.com/ziglibs/known-folders#175f5596b3d2ee3c658282bb07885580895a0e73",
-            .hash = "known_folders-0.0.0-Fy-PJk7KAAC41mQXzmFyGa0Q7tvmQjatENkREa6Gc4zu",
+            .url = "git+https://github.com/ziglibs/known-folders#207c34a16e4365edc20d92c7892f962b3bed46e8",
+            .hash = "known_folders-0.0.0-Fy-PJsbKAACbDh9bBxR0MMThxZSS6A9RH4apWphNHY70",
         },
         .lsp_kit = .{
-            .url = "git+https://github.com/zigtools/lsp-kit#ec325a3c33d1da7708cf513355208f74d9560580",
-            .hash = "lsp_kit-0.1.0-bi_PL_kyDACVTEhLaMq2-PJx0MocqRyjXDAN0ybMUyQQ",
+            .url = "git+https://github.com/zigtools/lsp-kit#d148676ace1eaecf3c703ce7d350d0e94e502ed7",
+            .hash = "lsp_kit-0.1.0-bi_PLwc2DACoR7VTz_qKFXUvtx7veHvWcTQvP9pDFLpk",
         },
         // .yaml = .{
         //     .url = "git+https://github.com/dotcarmen/zig-yaml.git?ref=0.16-io-interface#695e62bb080028fdd0b33145a1dd6d1d7879ac42",
         //     .hash = "zig_yaml-0.2.0-C1161jirAgAUjfuDVZPH4SvzvXYu0FlvakDifJzAsEF2",
         // },
+        .afl_kit = .{
+            .url = "git+https://github.com/kristoff-it/zig-afl-kit#e9b5dfc14c06133786a09214709316dc9fb54bd9",
+            .hash = "afl_kit-0.1.0-NdJ3ctQfAACNK1UANoF4pwkWOdW-JGLXHby9OE9-xMPq",
+        },
+        .ansi_term = .{
+            .url = "git+https://github.com/kristoff-it/ansi_term?ref=fixes#c4679e859bd61259754bd312e59b54dd03957e90",
+            .hash = "ansi_term-0.3.0-_baAyzFoAACjFHF9VpZSo71Q7QUclZQlpYqZZShaNwYg",
+        },
     },
     .paths = .{
+        "build",
         "build.zig",
         "build.zig.zon",
         "src",

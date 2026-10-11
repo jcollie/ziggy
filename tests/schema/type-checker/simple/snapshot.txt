@@ -1,0 +1,4 @@
+root.RootErr1: missing field 'b' (int)
+root.RootErr2.c: field not in schema
+root.RootErr3.b_oops: field not in schema
+root.RootErr3: missing field 'b' (int)

@@ -1,0 +1,2 @@
+root.RootErr.MyStructErr.MyUnionErr: must be a tagged union to be (de)serialized
+root.RootErr1.MyStructErr1.MyUnionErr1: is of kind 'enum' but the schema union has at least one payload

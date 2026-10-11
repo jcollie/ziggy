@@ -16,12 +16,26 @@ nodes: []const Node,
 errors: []const Error,
 scopes: Scopes = .empty,
 
+pub fn init(gpa: Allocator, src: [:0]const u8) !Ast {
+    var p: Parser = .{ .gpa = gpa, .src = src };
+    return p.parse();
+}
+
+pub fn deinit(ast: Ast, gpa: Allocator) void {
+    gpa.free(ast.nodes);
+    gpa.free(ast.errors);
+    for (ast.scopes.values()) |*v| {
+        v.fields.deinit(gpa);
+        v.types.deinit(gpa);
+    }
+    @constCast(&ast.scopes).deinit(gpa);
+}
+
 /// Validating a Ziggy Document AST is necessary to detect duplicate fields.
 /// A Ziggy Document that doesn't have a specific schema can always be matched
 /// with the default `$ = any` schema, which is what `validateDefault` makes
 /// convenient to do.
 ///
-/// Asserts that the schema does not contain errors.
 /// Asserts that the document does not contain errors.
 /// Caller owns returned memory.
 pub fn validateDefault(
@@ -32,28 +46,65 @@ pub fn validateDefault(
     return default.validate(gpa, default_src, ziggy_ast, ziggy_src);
 }
 
-pub const default_src = "$ = any";
-pub const default: Ast = .{
-    .has_syntax_errors = false,
-    .errors = &.{},
-    .nodes = &.{
-        .{
-            .tag = .root,
-            .parent_idx = 0,
-            .loc = .{ .start = 0, .end = default_src.len },
-        },
-        .{
-            .tag = .root_expr,
-            .parent_idx = 0,
-            .loc = .{ .start = 0, .end = default_src.len },
-        },
-        .{
-            .tag = .type_expr,
-            .parent_idx = 1,
-            .loc = .{ .start = "$ = ".len, .end = default_src.len },
-        },
-    },
+/// Given a node index, returns a pointer to its first child or null.
+/// Use this function in contexts where the node might not have children,
+/// write the code explicitly otherwise (using asserts instead of branching).
+///
+/// If the child is present, its idx is `parent_idx + 1`.
+/// if you're trying to get the type expression of a field, use `fieldTypeExpr`.
+pub fn child(ast: *const Ast, parent_idx: u32) ?*const Node {
+    assert(parent_idx < ast.nodes.len);
+    const child_idx = parent_idx + 1;
+    if (child_idx == ast.nodes.len) return null;
+    const ch = &ast.nodes[child_idx];
+    if (ch.parent_idx != parent_idx) return null;
+    return ch;
+}
+
+const TypeExpr = struct {
+    loc: Loc,
+    it: Tokenizer,
 };
+
+/// Returns the type expression of a struct/union field.
+/// In case of a payloadless union field, returns null.
+pub inline fn fieldTypeExpr(ast: *const Ast, field_idx: u32) ?TypeExpr {
+    assert(ast.nodes[field_idx].tag == .struct_field or
+        ast.nodes[field_idx].tag == .union_field);
+
+    const field_type_idx = field_idx + 1;
+    if (field_type_idx < ast.nodes.len) {
+        const type_node = ast.nodes[field_type_idx];
+        if (type_node.parent_idx == field_idx) {
+            assert(type_node.tag == .type_expr);
+            return .{
+                .loc = type_node.loc,
+                .it = .{ .idx = type_node.loc.start },
+            };
+        }
+    }
+
+    assert(ast.nodes[field_idx].tag == .union_field);
+    return null;
+}
+
+/// Searches recursively upwards for `type_name` starting from `starting_scope`.
+/// Returns the node_idx of the found container type. Its parent_idx is the new scope.
+pub fn findContainerType(ast: *const Ast, starting_scope: u32, type_name: []const u8) ?u32 {
+    return findContainerTypeImpl(ast.nodes, &ast.scopes, starting_scope, type_name);
+}
+
+pub const ContainerInfo = struct {
+    name: Loc,
+    kind: Kind,
+
+    pub const Kind = enum { @"struct", @"union" };
+};
+
+/// Returns name and kind for a container type (struct or union).
+pub fn containerInfo(ast: *const Ast, src: [:0]const u8, container_idx: u32) ContainerInfo {
+    return containerInfoImpl(ast.nodes, src, container_idx);
+}
 
 pub const Scopes = std.AutoArrayHashMapUnmanaged(u32, struct {
     fields: std.StringArrayHashMapUnmanaged(struct {
@@ -78,7 +129,7 @@ pub const Error = struct {
         /// happens with a name from an outer scope.
         type_name_collision: u32, // node idx of the original
         undeclared_identifier,
-        infinite_loop_container: ContainerKind,
+        infinite_loop_container: ContainerInfo.Kind,
         infinite_loop_field,
         empty_union,
         unreachable_type, // TODO
@@ -140,9 +191,9 @@ pub const Node = struct {
     tag: Tag,
     loc: Loc = undefined,
     // 0 = not present
-    // To disambiguate doc comments that start at index zero, when the field is
-    // set it points at the second slash in `///` so you must subtract 1 before
-    // retokenizing.
+    // To disambiguate doc comments that start at index zero, when the
+    // field is set, it points at the second slash in `///` so you must
+    // subtract 1 before retokenizing.
     docs_offset: u32 = 0,
 
     parent_idx: u32,
@@ -173,26 +224,10 @@ pub const Node = struct {
     };
 };
 
-pub fn deinit(ast: Ast, gpa: Allocator) void {
-    gpa.free(ast.nodes);
-    gpa.free(ast.errors);
-    for (ast.scopes.values()) |*v| {
-        v.fields.deinit(gpa);
-        v.types.deinit(gpa);
-    }
-    @constCast(&ast.scopes).deinit(gpa);
-}
-
-pub fn init(gpa: Allocator, src: [:0]const u8) !Ast {
-    var p: Parser = .{ .gpa = gpa, .src = src };
-    return p.parse();
-}
-
-const ContainerKind = enum { @"struct", @"union" };
 const Parser = struct {
     gpa: Allocator,
     src: [:0]const u8,
-    tokenizer: Tokenizer = .{},
+    tokenizer: Tokenizer = .init,
     node_idx: u32 = 0,
     prev_loc: Loc = undefined,
     tok: Token = .{ .tag = .invalid, .loc = .{ .start = 0, .end = 0 } },
@@ -237,6 +272,10 @@ const Parser = struct {
             v.types.deinit(p.gpa);
         }
         p.scopes.deinit(p.gpa);
+    }
+
+    fn findContainerType(p: *Parser, starting_scope: u32, type_name: []const u8) ?u32 {
+        return findContainerTypeImpl(p.nodes.items, &p.scopes, starting_scope, type_name);
     }
 
     fn parse(p: *Parser) error{OutOfMemory}!Ast {
@@ -945,6 +984,7 @@ const Parser = struct {
     fn consume(p: *Parser) void {
         p.prev_loc = p.tok.loc;
         p.tok = p.tokenizer.next(p.src);
+        // log.debug("new tok: [{t}] '{s}'", .{ p.tok.tag, p.tok.loc.slice(p.src) });
     }
 
     fn node(p: *Parser) *Node {
@@ -969,7 +1009,7 @@ const Parser = struct {
         const container_idx, const scope_slot: u32 = switch (tag) {
             .@"struct", .@"union" => blk: {
                 add_to_parent_scope: {
-                    var t: Tokenizer = .{ .idx = p.tok.loc.end };
+                    var t: Tokenizer = .initFrom(p.tok.loc.end);
                     const name_tok = t.next(p.src);
                     if (name_tok.tag != .identifier) break :add_to_parent_scope;
                     const name = name_tok.loc.slice(p.src);
@@ -1131,20 +1171,14 @@ const Parser = struct {
 
     fn validateIdentifiers(p: *Parser) !void {
         assert(!p.has_syntax_errors);
-        refs: for (p.refs.items) |r| {
+        for (p.refs.items) |r| {
             const name = r.loc.slice(p.src);
-            var container_idx = r.container_idx;
-            while (true) {
-                const scope = p.scopes.get(container_idx).?;
-                if (scope.types.contains(name)) continue :refs;
-                if (container_idx == 0) break;
-                container_idx = p.nodes.items[container_idx].parent_idx;
+            if (p.findContainerType(r.container_idx, name) == null) {
+                try p.err(.{
+                    .tag = .undeclared_identifier,
+                    .main_location = r.loc,
+                });
             }
-
-            try p.err(.{
-                .tag = .undeclared_identifier,
-                .main_location = r.loc,
-            });
         }
 
         for (p.scopes.keys()[1..]) |cidx| {
@@ -1185,7 +1219,7 @@ const Parser = struct {
         // key is a union container idx
         var loopy_unions: std.AutoHashMapUnmanaged(u32, std.ArrayList(struct {
             container_idx: u32,
-            container_kind: ContainerKind,
+            container_kind: ContainerInfo.Kind,
             container_name: Loc,
             field_name: Loc,
         })) = .empty;
@@ -1197,7 +1231,7 @@ const Parser = struct {
 
         // key is container_idx
         var dfs_path: std.AutoArrayHashMapUnmanaged(u32, struct {
-            container_kind: ContainerKind,
+            container_kind: ContainerInfo.Kind,
             container_name: Loc,
             outbound_field: Loc,
             last_option: bool, // always true for struct fields
@@ -1206,7 +1240,7 @@ const Parser = struct {
 
         const top_lvl_names = p.scopes.get(0).?.types;
         for (top_lvl_names.values()) |top_level_container_idx| {
-            log.debug("exploring top level type {}", .{top_level_container_idx});
+            // log.debug("exploring top level type {}", .{top_level_container_idx});
             assert(unexplored_paths.items.len == 0);
             assert(dfs_path.entries.len == 0);
 
@@ -1231,9 +1265,8 @@ const Parser = struct {
                     continue :explore;
                 }
 
-                const source_container = containerInfo(p.nodes.items, p.src, source_container_idx);
+                const source_container = containerInfoImpl(p.nodes.items, p.src, source_container_idx);
 
-                log.debug("adding {any} to path\n", .{ux});
                 const gop_p = try dfs_path.getOrPut(p.gpa, source_container_idx);
                 if (gop_p.found_existing) {
                     const suffix_keys = dfs_path.keys()[gop_p.index..];
@@ -1308,14 +1341,14 @@ const Parser = struct {
                     .last_option = ux.last_option,
                 };
 
-                log.debug("field '{s}' ({}) of {t} {s} ({}) resolved to type ({})\n", .{
-                    ux.field.name_loc.slice(p.src),
-                    ux.field.node_idx,
-                    source_container.kind,
-                    source_container.name.slice(p.src),
-                    source_container_idx,
-                    ux.field.target_container_idx,
-                });
+                // log.debug("field '{s}' ({}) of {t} {s} ({}) resolved to type ({})\n", .{
+                //     ux.field.name_loc.slice(p.src),
+                //     ux.field.node_idx,
+                //     source_container.kind,
+                //     source_container.name.slice(p.src),
+                //     source_container_idx,
+                //     ux.field.target_container_idx,
+                // });
 
                 var it = p.fieldIterator(ux.field.target_container_idx);
                 switch (it.container_kind) {
@@ -1391,7 +1424,7 @@ const Parser = struct {
         nodes: []const Node,
         scopes: *const Scopes,
         src: [:0]const u8,
-        container_kind: ContainerKind,
+        container_kind: ContainerInfo.Kind,
         container_idx: u32,
         next_field_idx: u32,
 
@@ -1445,19 +1478,21 @@ const Parser = struct {
                 }
 
                 const expr_idx = field.childIdx(fi.nodes) orelse continue;
+
                 const expr = fi.nodes[expr_idx];
-                var t: Tokenizer = .{ .idx = expr.loc.start };
+                var t: Tokenizer = .initFrom(expr.loc.start);
                 const tok = t.next(fi.src);
                 switch (tok.tag) {
                     else => continue,
                     .identifier => {
-                        const target = resolveContainer(
+                        const target_idx = findContainerTypeImpl(
                             fi.nodes,
                             fi.scopes,
-                            fi.src,
-                            tok.loc.slice(fi.src),
                             fi.container_idx,
+                            tok.loc.slice(fi.src),
                         ).?;
+
+                        const target_info = containerInfoImpl(fi.nodes, fi.src, target_idx);
 
                         const name_loc = blk: {
                             t.idx = field.loc.start;
@@ -1469,8 +1504,8 @@ const Parser = struct {
                         return .{
                             .name_loc = name_loc,
                             .node_idx = fi.next_field_idx,
-                            .target_container_idx = target.node_idx,
-                            .target_container_name = target.name,
+                            .target_container_idx = target_idx,
+                            .target_container_name = target_info.name,
                             // .target_container_kind = target.kind,
                         };
                     },
@@ -1491,7 +1526,7 @@ const Parser = struct {
                     .union_field => {
                         const expr_idx = field.childIdx(fi.nodes) orelse return true;
                         const expr = fi.nodes[expr_idx];
-                        var t: Tokenizer = .{ .idx = expr.loc.start };
+                        var t: Tokenizer = .initFrom(expr.loc.start);
                         switch (t.next(fi.src).tag) {
                             .identifier => continue,
                             else => return true,
@@ -1501,57 +1536,17 @@ const Parser = struct {
             } else return false;
         }
     };
-
-    const ResolvedContainer = struct {
-        name: Loc,
-        node_idx: u32,
-        kind: ContainerKind,
-    };
-    fn resolveContainer(
-        nodes: []const Node,
-        scopes: *const Scopes,
-        src: [:0]const u8,
-        name: []const u8,
-        source_container_idx: u32,
-    ) ?ResolvedContainer {
-        var container_idx = source_container_idx;
-        while (true) {
-            const scope = scopes.get(container_idx).?.types;
-            if (scope.getEntry(name)) |entry| {
-                const slice = entry.key_ptr.*;
-                const start: u32 = @intCast(slice.ptr - src.ptr);
-                return .{
-                    .node_idx = entry.value_ptr.*,
-                    .name = .{
-                        .start = start,
-                        .end = @intCast(start + slice.len),
-                    },
-                    .kind = switch (nodes[entry.value_ptr.*].tag) {
-                        .@"struct" => .@"struct",
-                        .@"union" => .@"union",
-                        else => unreachable,
-                    },
-                };
-            }
-            if (container_idx == 0) return null;
-            container_idx = nodes[container_idx].parent_idx;
-        }
-    }
 };
 
-const ContainerInfo = struct {
-    name: Loc,
-    kind: ContainerKind,
-};
-
-fn containerInfo(nodes: []const Node, src: [:0]const u8, container_idx: u32) ContainerInfo {
+fn containerInfoImpl(nodes: []const Node, src: [:0]const u8, container_idx: u32) ContainerInfo {
+    assert(container_idx != 0);
     const container = nodes[container_idx];
-    const container_kind: ContainerKind = switch (container.tag) {
+    const container_kind: ContainerInfo.Kind = switch (container.tag) {
         .@"struct" => .@"struct",
         .@"union" => .@"union",
         else => unreachable,
     };
-    var t: Tokenizer = .{ .idx = container.loc.start };
+    var t: Tokenizer = .initFrom(container.loc.start);
     _ = t.next(src);
     const tok = t.next(src);
     assert(tok.tag == .identifier);
@@ -1601,7 +1596,7 @@ const Fmt = struct {
             direction: switch (direction) {
                 .enter => {
                     const container_src = f.src[c.loc.start..]; // preserves null terminator
-                    var t: Tokenizer = .{};
+                    var t: Tokenizer = .init;
                     const container_kw = t.next(container_src);
                     assert(container_kw.tag == .struct_kw or container_kw.tag == .union_kw);
                     const name = t.next(container_src);
@@ -1628,7 +1623,7 @@ const Fmt = struct {
                             },
                             .struct_field, .union_field => {
                                 const field_src = f.src[elem.loc.start..];
-                                var field_t: Tokenizer = .{};
+                                var field_t: Tokenizer = .init;
                                 const field_name = field_t.next(field_src);
                                 assert(field_name.tag == .identifier);
                                 try f.printDocs(elem, w, indent);
@@ -1706,7 +1701,7 @@ const Fmt = struct {
         if (n.docs_offset == 0) return;
         const docs_src = f.src[n.docs_offset - 1 ..];
 
-        var t: Tokenizer = .{};
+        var t: Tokenizer = .init;
         while (true) {
             const tok = t.next(docs_src);
             if (tok.tag != .doc_comment_line) return;
@@ -1940,24 +1935,15 @@ pub fn validate(
                         switch (expr.tag) {
                             .any_kw => {},
                             .identifier, .opt_identifier => {
-                                const scope = scopes_stack.getLast();
+                                const scope = scopes_stack.last().?;
                                 const container_name = expr.loc.slice(schema_src);
                                 const search_name = switch (expr.tag) {
                                     .identifier => container_name,
                                     .opt_identifier => container_name[1..], // skip '?'
                                     else => unreachable,
                                 };
-                                var current_scope = scope;
-                                const container_idx = while (true) {
-                                    break schema_ast.scopes.get(current_scope).?.types.get(
-                                        search_name,
-                                    ) orelse {
-                                        assert(current_scope != 0);
-                                        current_scope = schema_ast.nodes[current_scope].parent_idx;
-                                        continue;
-                                    };
-                                };
-                                const info = containerInfo(
+                                const container_idx = schema_ast.findContainerType(scope, search_name).?;
+                                const info = containerInfoImpl(
                                     schema_ast.nodes,
                                     schema_src,
                                     container_idx,
@@ -2017,24 +2003,15 @@ pub fn validate(
                                 any_ziggy_start = node;
                             },
                             .identifier, .opt_identifier => {
-                                const scope = scopes_stack.getLast();
+                                const scope = scopes_stack.last().?;
                                 const container_name = expr.loc.slice(schema_src);
                                 const search_name = switch (expr.tag) {
                                     .identifier => container_name,
                                     .opt_identifier => container_name[1..], // skip '?'
                                     else => unreachable,
                                 };
-                                var current_scope = scope;
-                                const container_idx = while (true) {
-                                    break schema_ast.scopes.get(current_scope).?.types.get(
-                                        search_name,
-                                    ) orelse {
-                                        assert(current_scope != 0);
-                                        current_scope = schema_ast.nodes[current_scope].parent_idx;
-                                        continue;
-                                    };
-                                };
-                                const info = containerInfo(schema_ast.nodes, schema_src, container_idx);
+                                const container_idx = schema_ast.findContainerType(scope, search_name).?;
+                                const info = containerInfoImpl(schema_ast.nodes, schema_src, container_idx);
                                 switch (info.kind) {
                                     .@"struct" => {
                                         try errors.append(gpa, .{
@@ -2051,6 +2028,7 @@ pub fn validate(
                                         continue;
                                     },
                                     .@"union" => {
+                                        log.debug("union '{s}' -> {}", .{ search_name, container_idx });
                                         var t: ZiggyTokenizer = .{
                                             .lines = 0,
                                             .delimiter = .none,
@@ -2094,6 +2072,10 @@ pub fn validate(
                                         type_expr_idx += 1;
                                         if (type_expr_stack.items[type_expr_idx].tag == .any_kw) {
                                             if (any_ziggy_start == null) any_ziggy_start = node;
+                                        }
+
+                                        if (any_ziggy_start == null) {
+                                            try scopes_stack.append(gpa, container_idx);
                                         }
                                     },
                                 }
@@ -2139,24 +2121,17 @@ pub fn validate(
                                 try seen_fields_stack.append(gpa, .{ .dict = .empty });
                             },
                             .identifier, .opt_identifier => {
-                                const scope = scopes_stack.getLast();
+                                const scope = scopes_stack.last().?;
                                 const container_name = expr.loc.slice(schema_src);
                                 const search_name = switch (expr.tag) {
                                     .identifier => container_name,
                                     .opt_identifier => container_name[1..], // skip '?'
                                     else => unreachable,
                                 };
-                                var current_scope = scope;
-                                const container_idx = while (true) {
-                                    break schema_ast.scopes.get(current_scope).?.types.get(
-                                        search_name,
-                                    ) orelse {
-                                        assert(current_scope != 0);
-                                        current_scope = schema_ast.nodes[current_scope].parent_idx;
-                                        continue;
-                                    };
-                                };
-                                const info = containerInfo(schema_ast.nodes, schema_src, container_idx);
+
+                                log.debug("search name = '{s}' scope = {}", .{ search_name, scope });
+                                const container_idx = schema_ast.findContainerType(scope, search_name).?;
+                                const info = containerInfoImpl(schema_ast.nodes, schema_src, container_idx);
                                 switch (info.kind) {
                                     .@"union" => {
                                         try errors.append(gpa, .{
@@ -2173,6 +2148,7 @@ pub fn validate(
                                         continue;
                                     },
                                     .@"struct" => {
+                                        log.debug("struct '{s}' -> {}", .{ search_name, container_idx });
                                         try scopes_stack.append(gpa, container_idx);
                                         const size = schema_ast.scopes.get(container_idx).?.fields.count();
                                         try seen_fields_stack.append(gpa, .{
@@ -2214,7 +2190,7 @@ pub fn validate(
                         switch (seen.*) {
                             .@"struct" => |*bits| {
                                 assert(expr.tag != .any_kw);
-                                const scope = schema_ast.scopes.get(scopes_stack.getLast()).?;
+                                const scope = schema_ast.scopes.get(scopes_stack.last().?).?;
                                 const field_slot = scope.fields.getIndex(name) orelse {
                                     try errors.append(gpa, .{
                                         .tag = .unknown_field,
@@ -2314,17 +2290,23 @@ pub fn validate(
                                 const scope = schema_ast.scopes.get(container_idx).?;
                                 var it = bits.iterator(.{ .kind = .unset });
                                 while (it.next()) |field_idx| {
-                                    try errors.append(gpa, .{
-                                        .tag = .{
-                                            .missing_field = scope.fields.values()[field_idx].loc.slice(
-                                                schema_src,
-                                            ),
-                                        },
-                                        .main_location = .{
-                                            .start = node.loc.end - 1,
-                                            .end = node.loc.end,
-                                        },
-                                    });
+                                    // Fields of outer type '?', '{:}' and '[]' can be omitted.
+                                    const scope_field = scope.fields.values()[field_idx];
+                                    const offset = schema_ast.nodes[scope_field.idx + 1].loc.start;
+                                    switch (schema_src[offset]) {
+                                        '?', '{', '[' => continue,
+                                        else => try errors.append(gpa, .{
+                                            .tag = .{
+                                                .missing_field = scope_field.loc.slice(
+                                                    schema_src,
+                                                ),
+                                            },
+                                            .main_location = .{
+                                                .start = node.loc.end - 1,
+                                                .end = node.loc.end,
+                                            },
+                                        }),
+                                    }
                                 }
                                 bits.deinit(gpa);
                             },
@@ -2351,7 +2333,12 @@ pub fn validate(
                     },
                     .@"union", .dict_field, .array_element => {
                         const start = any_ziggy_start orelse {
-                            if (node.tag == .@"union") type_expr_stack.items.len = type_expr_idx;
+                            if (node.tag == .@"union") {
+                                const container_idx = scopes_stack.pop().?;
+                                assert(containerInfoImpl(schema_ast.nodes, schema_src, container_idx).kind == .@"union");
+
+                                type_expr_stack.items.len = type_expr_idx;
+                            }
                             type_expr_idx -= 1;
                             continue;
                         };
@@ -2377,7 +2364,7 @@ fn loadExpr(
     stack: *std.ArrayList(Token),
     node_idx: u32,
 ) !void {
-    var tokenizer: Tokenizer = .{ .idx = schema_ast.nodes[node_idx].loc.start };
+    var tokenizer: Tokenizer = .initFrom(schema_ast.nodes[node_idx].loc.start);
     log.debug("load expr start", .{});
     while (true) {
         const t = tokenizer.next(schema_src);
@@ -2406,9 +2393,16 @@ fn loadExpr(
     }
 }
 
+pub const ResolvedOffset = struct {
+    scope_idx: u32,
+    field_idx: u32,
+    expr_it: Tokenizer,
+    ziggy_idx: u32,
+};
+
 /// Resolves an offset in a Ziggy document to a corresponding schema node, which
 /// can then be used for providing documentation, goto definition, etc.
-/// Returns 0 in case of resolution failure, which can happen if the Ziggy
+/// Returns `null` in case of resolution failure, which can happen if the Ziggy
 /// document contains errors.
 ///
 /// Asserts that the schema does not contain errors.
@@ -2418,13 +2412,14 @@ pub fn resolveZiggyOffset(
     ziggy_ast: ZiggyAst,
     ziggy_src: [:0]const u8,
     ziggy_offset: u32,
-) u32 {
+) ?ResolvedOffset {
     assert(schema_ast.errors.len == 0);
 
     var scope_idx: u32 = 0;
+    var type_expr_idx: u32 = 2; // root_expr
+    var tokenizer: Tokenizer = .initFrom(schema_ast.nodes[type_expr_idx].loc.start);
+
     var ziggy_idx: u32 = 1;
-    var schema_idx: u32 = 2; // root_expr
-    var tokenizer: Tokenizer = .{ .idx = schema_ast.nodes[schema_idx].loc.start };
     var ziggy_node = ziggy_ast.nodes[ziggy_idx];
 
     outer: while (true) {
@@ -2432,107 +2427,181 @@ pub fn resolveZiggyOffset(
             scope_idx,
             ziggy_idx,
             ziggy_node.tag,
-            schema_idx,
+            type_expr_idx,
         });
 
         if (ziggy_node.loc.start > ziggy_offset or ziggy_node.loc.end <= ziggy_offset) {
-            return 0;
+            return null;
         }
 
         const t = tokenizer.next(schema_src);
         switch (t.tag) {
             .slice_sigil, .opt_slice_sigil => switch (ziggy_node.tag) {
-                .null => if (t.tag == .opt_slice_sigil) return schema_idx else return 0,
+                .null => if (t.tag == .opt_slice_sigil) return .{
+                    .scope_idx = scope_idx,
+                    .field_idx = type_expr_idx - 1,
+                    .expr_it = tokenizer,
+                    .ziggy_idx = ziggy_idx,
+                } else return null,
                 .array_h, .array_v => {
                     var child_idx = ziggy_idx + 1;
                     if (child_idx == ziggy_ast.nodes.len or
-                        ziggy_ast.nodes[child_idx].parent_idx != ziggy_idx) return schema_idx;
+                        ziggy_ast.nodes[child_idx].parent_idx != ziggy_idx) return .{
+                        .scope_idx = scope_idx,
+                        .field_idx = type_expr_idx - 1,
+                        .expr_it = tokenizer,
+                        .ziggy_idx = ziggy_idx,
+                    };
                     while (child_idx != 0) {
-                        const child = ziggy_ast.nodes[child_idx];
-                        defer child_idx = child.next_idx;
+                        const ch = ziggy_ast.nodes[child_idx];
+                        defer child_idx = ch.next_idx;
 
-                        if (child.loc.start <= ziggy_offset and child.loc.end > ziggy_offset) {
-                            ziggy_idx = child_idx;
-                            ziggy_node = child;
+                        log.debug("resolving array child {} [{s}] {any} ", .{
+                            child_idx,
+                            ch.loc.slice(ziggy_src),
+                            ch.loc,
+                        });
+
+                        if (ch.loc.start <= ziggy_offset and ch.loc.end > ziggy_offset) {
+                            const value_idx = child_idx + 1;
+                            const value = ziggy_ast.nodes[value_idx];
+                            // if (value.tag == .missing_value) return .{
+                            //     .scope_idx = scope_idx,
+                            //     .field_expr_idx = type_expr_idx,
+                            //     .expr_it = tokenizer,
+                            //     .ziggy_idx = ziggy_idx,
+                            //     // .missing_value = true,
+                            // };
+
+                            ziggy_idx = value_idx;
+                            ziggy_node = value;
+                            continue :outer;
                         }
                     }
 
-                    return schema_idx;
+                    return .{
+                        .scope_idx = scope_idx,
+                        .field_idx = type_expr_idx - 1,
+                        .expr_it = tokenizer,
+                        .ziggy_idx = ziggy_idx,
+                    };
                 },
-                else => return 0,
+                else => return null,
             },
             .identifier, .opt_identifier => {
-                if (t.tag == .opt_identifier and ziggy_node.tag == .null) return schema_idx;
+                if (t.tag == .opt_identifier and ziggy_node.tag == .null) return .{
+                    .scope_idx = scope_idx,
+                    .field_idx = type_expr_idx - 1,
+                    .expr_it = tokenizer,
+                    .ziggy_idx = ziggy_idx,
+                };
 
                 const container_name = t.loc.slice(schema_src);
-                const container_idx = schema_ast.scopes.get(scope_idx).?.types.get(
-                    switch (t.tag) {
-                        .identifier => container_name,
-                        .opt_identifier => container_name[1..],
-                        else => unreachable,
-                    },
-                ) orelse return 0;
-                const info = containerInfo(schema_ast.nodes, schema_src, container_idx);
+                const container_idx = schema_ast.findContainerType(scope_idx, switch (t.tag) {
+                    .identifier => container_name,
+                    .opt_identifier => container_name[1..],
+                    else => unreachable,
+                }).?;
+                const info = containerInfoImpl(schema_ast.nodes, schema_src, container_idx);
 
                 switch (info.kind) {
                     .@"struct" => {
-                        log.debug("resolve: struct!\n", .{});
+                        log.debug("resolve: struct! ziggy_tag = {t}", .{ziggy_node.tag});
                         switch (ziggy_node.tag) {
                             .braceless_struct, .struct_h, .struct_v => {
                                 var field_idx = ziggy_idx + 1;
                                 if (field_idx == ziggy_ast.nodes.len or
                                     ziggy_ast.nodes[field_idx].parent_idx != ziggy_idx)
                                 {
-                                    return schema_idx;
+                                    log.debug("resolve: empty struct", .{});
+                                    return .{
+                                        .scope_idx = container_idx,
+                                        .field_idx = type_expr_idx,
+
+                                        .expr_it = tokenizer,
+                                        .ziggy_idx = ziggy_idx,
+                                    };
                                 }
 
                                 while (field_idx != 0) {
-                                    const child = ziggy_ast.nodes[field_idx];
-                                    defer field_idx = child.next_idx;
+                                    const ch = ziggy_ast.nodes[field_idx];
+                                    defer field_idx = ch.next_idx;
 
-                                    if (child.loc.start <= ziggy_offset and child.loc.end > ziggy_offset) {
+                                    log.debug("evaluating [{s}]", .{ch.loc.slice(ziggy_src)});
+
+                                    if (ch.loc.start <= ziggy_offset and ch.loc.end > ziggy_offset) {
+                                        var name_t: ZiggyTokenizer = .{
+                                            .lines = 0,
+                                            .delimiter = .none,
+                                            .idx = ch.loc.start,
+                                        };
+                                        const name_tok = name_t.next(ziggy_src, true);
                                         const name = blk: {
-                                            var name_t: ZiggyTokenizer = .{
-                                                .lines = 0,
-                                                .delimiter = .none,
-                                                .idx = child.loc.start,
-                                            };
-                                            const tok = name_t.next(ziggy_src, true);
-                                            assert(tok.tag == .identifier);
-                                            switch (tok.tag) {
-                                                .identifier => break :blk tok.loc.slice(ziggy_src)[1..], // skip the leading dot
+                                            assert(name_tok.tag == .identifier);
+                                            switch (name_tok.tag) {
+                                                .identifier => break :blk name_tok.loc.slice(ziggy_src)[1..], // skip the leading dot
                                                 .bytes => {
-                                                    const raw = tok.loc.slice(ziggy_src);
+                                                    const raw = name_tok.loc.slice(ziggy_src);
                                                     break :blk raw[1 .. raw.len - 1]; // skip the quotes
                                                 },
                                                 else => unreachable,
                                             }
                                         };
+
+                                        // const sep = name_t.next();
+                                        // const value_start =  switch(sep.tag) {
+                                        //     .colon, .eql => sep.loc.end,
+                                        //     else => name_tok.loc.end,
+                                        // };
+
                                         log.debug("resolve: field name: {s}\n", .{name});
-                                        const schema_field = schema_ast.scopes.get(container_idx).?.fields.get(name) orelse return 0;
+                                        const schema_field = schema_ast.scopes.get(container_idx).?.fields.get(name) orelse return null;
+                                        const value = ziggy_ast.nodes[field_idx + 1];
 
                                         // is the offset in the field or in the value?
-                                        const value = ziggy_ast.nodes[field_idx + 1];
-                                        if (value.loc.start <= ziggy_offset and child.loc.end > ziggy_offset) {
+                                        if (value.loc.start <= ziggy_offset and ch.loc.end > ziggy_offset) {
                                             log.debug("resolve: value hit", .{});
+
+                                            type_expr_idx = schema_field.idx + 1;
+                                            tokenizer = .{
+                                                .idx = schema_ast.nodes[type_expr_idx].loc.start,
+                                            };
+
+                                            if (value.tag == .missing_value) return .{
+                                                .scope_idx = container_idx,
+                                                .field_idx = schema_field.idx,
+                                                .expr_it = tokenizer,
+                                                .ziggy_idx = field_idx + 1,
+                                                // .missing_value = true,
+                                            };
+
+                                            scope_idx = container_idx;
                                             ziggy_idx = field_idx + 1;
                                             ziggy_node = value;
-                                            scope_idx = container_idx;
-                                            schema_idx = schema_field.idx + 1;
-                                            tokenizer = .{
-                                                .idx = schema_ast.nodes[schema_idx].loc.start,
-                                            };
+
+                                            log.debug("looping on value", .{});
                                             continue :outer;
                                         }
 
                                         log.debug("resolve: field hit", .{});
-                                        return schema_field.idx;
+                                        return .{
+                                            .scope_idx = container_idx,
+                                            .field_idx = schema_field.idx,
+                                            .expr_it = tokenizer,
+                                            .ziggy_idx = field_idx,
+                                        };
                                     }
                                 }
 
-                                return container_idx;
+                                log.debug("resolve: end of struct", .{});
+                                return .{
+                                    .scope_idx = container_idx,
+                                    .field_idx = type_expr_idx - 1,
+                                    .expr_it = tokenizer,
+                                    .ziggy_idx = ziggy_idx,
+                                };
                             },
-                            else => return 0,
+                            else => return null,
                         }
                     },
                     .@"union" => switch (ziggy_node.tag) {
@@ -2549,55 +2618,95 @@ pub fn resolveZiggyOffset(
                                 break :blk raw[1 .. raw.len - 1]; // skip '.' and '('
 
                             };
-                            const schema_field = schema_ast.scopes.get(container_idx).?.fields.get(name) orelse return 0;
+                            const schema_field = schema_ast.scopes.get(container_idx).?.fields.get(name) orelse return null;
 
                             // is the offset in the field or in the value?
                             const value = ziggy_ast.nodes[ziggy_idx + 1];
                             if (value.loc.start <= ziggy_offset and ziggy_node.loc.end > ziggy_offset) {
+                                if (value.tag == .missing_value) return .{
+                                    .scope_idx = scope_idx,
+                                    .field_idx = schema_field.idx,
+                                    .expr_it = tokenizer,
+                                    .ziggy_idx = ziggy_idx,
+                                    // .missing_value = true,
+                                };
+
+                                log.debug("union value hit [{s}]", .{schema_field.loc.slice(schema_src)});
+
                                 ziggy_idx += 1;
                                 ziggy_node = value;
                                 scope_idx = container_idx;
-                                schema_idx = schema_field.idx + 1;
-                                tokenizer = .{ .idx = schema_ast.nodes[schema_idx].loc.start };
+                                type_expr_idx = schema_field.idx + 1;
+                                tokenizer = .{ .idx = schema_ast.nodes[type_expr_idx].loc.start };
+
+                                log.debug("union value loop", .{});
                                 continue :outer;
                             }
 
-                            return schema_field.idx;
+                            return .{
+                                .scope_idx = scope_idx,
+                                .field_idx = schema_field.idx,
+                                .expr_it = tokenizer,
+                                .ziggy_idx = ziggy_idx,
+                            };
                         },
-                        else => return 0,
+                        else => return null,
                     },
                 }
             },
             .dict_sigil, .opt_dict_sigil => {
                 switch (ziggy_node.tag) {
-                    .null => if (t.tag == .opt_dict_sigil) return schema_idx else return 0,
+                    .null => if (t.tag == .opt_dict_sigil) return .{
+                        .scope_idx = scope_idx,
+                        .field_idx = type_expr_idx - 1,
+                        .expr_it = tokenizer,
+                        .ziggy_idx = ziggy_idx,
+                    } else return null,
                     .dict_h, .dict_v => {
                         var field_idx = ziggy_idx + 1;
                         if (field_idx == ziggy_ast.nodes.len or
                             ziggy_ast.nodes[field_idx].parent_idx != ziggy_idx)
                         {
-                            return 0;
+                            return null;
                         }
 
                         while (field_idx != 0) {
-                            const child = ziggy_ast.nodes[field_idx];
-                            defer field_idx = child.next_idx;
+                            const ch = ziggy_ast.nodes[field_idx];
+                            defer field_idx = ch.next_idx;
 
-                            if (child.loc.start <= ziggy_offset and child.loc.end > ziggy_offset) {
+                            if (ch.loc.start <= ziggy_offset and ch.loc.end > ziggy_offset) {
                                 // is the offset in the field or in the value?
                                 const value = ziggy_ast.nodes[field_idx + 1];
-                                if (value.loc.start <= ziggy_offset and child.loc.end > ziggy_offset) {
+                                if (value.loc.start <= ziggy_offset and ch.loc.end > ziggy_offset) {
+                                    if (value.tag == .missing_value) return .{
+                                        .scope_idx = scope_idx,
+                                        .field_idx = type_expr_idx - 1,
+                                        .expr_it = tokenizer,
+                                        .ziggy_idx = ziggy_idx,
+                                        // .missing_value = true,
+                                    };
+
                                     ziggy_idx = field_idx + 1;
                                     ziggy_node = value;
                                     continue :outer;
                                 }
 
-                                return schema_idx;
+                                return .{
+                                    .scope_idx = scope_idx,
+                                    .field_idx = type_expr_idx - 1,
+                                    .expr_it = tokenizer,
+                                    .ziggy_idx = ziggy_idx,
+                                };
                             }
                         }
-                        return schema_idx;
+                        return .{
+                            .scope_idx = scope_idx,
+                            .field_idx = type_expr_idx - 1,
+                            .expr_it = tokenizer,
+                            .ziggy_idx = ziggy_idx,
+                        };
                     },
-                    else => return 0,
+                    else => return null,
                 }
             },
             .opt_bytes_kw,
@@ -2609,9 +2718,72 @@ pub fn resolveZiggyOffset(
             .int_kw,
             .float_kw,
             .any_kw,
-            => return schema_idx,
+            => return .{
+                .scope_idx = scope_idx,
+                .field_idx = type_expr_idx - 1,
+                .expr_it = tokenizer,
+                .ziggy_idx = ziggy_idx,
+            },
             else => unreachable,
         }
+    }
+}
+
+/// Collects doc comments into a writer.
+/// Asserts that `docs_offset` is not 0.
+pub fn collectDocs(src: [:0]const u8, docs_offset: u32, w: *Writer) Writer.Error!void {
+    assert(docs_offset != 0);
+
+    var t: Tokenizer = .initFrom(docs_offset - 1);
+    while (true) {
+        const tok = t.next(src);
+        if (tok.tag != .doc_comment_line) break;
+        try w.print("{s}\n", .{std.mem.trim(
+            u8,
+            tok.loc.slice(src)[3..],
+            &std.ascii.whitespace,
+        )});
+    }
+}
+
+pub const default_src = "$ = any";
+pub const default: Ast = .{
+    .has_syntax_errors = false,
+    .errors = &.{},
+    .nodes = &.{
+        .{
+            .tag = .root,
+            .parent_idx = 0,
+            .loc = .{ .start = 0, .end = default_src.len },
+        },
+        .{
+            .tag = .root_expr,
+            .parent_idx = 0,
+            .loc = .{ .start = 0, .end = default_src.len },
+        },
+        .{
+            .tag = .type_expr,
+            .parent_idx = 1,
+            .loc = .{ .start = "$ = ".len, .end = default_src.len },
+        },
+    },
+};
+
+fn findContainerTypeImpl(
+    nodes: []const Node,
+    scopes: *const Scopes,
+    starting_scope: u32,
+    type_name: []const u8,
+) ?u32 {
+    var current_scope = starting_scope;
+    while (true) {
+        return scopes.get(current_scope).?.types.get( // starting_scope is not a scope?
+            type_name,
+        ) orelse {
+            if (current_scope == 0) return null;
+            current_scope = nodes[current_scope].parent_idx;
+            continue;
+        };
     }
 }
 
@@ -2815,8 +2987,8 @@ test "resolve simple struct field" {
     const schema_ast: Ast = try .init(gpa, schema_src);
     defer schema_ast.deinit(gpa);
 
-    const schema_idx = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 7);
-    try std.testing.expectEqual(4, schema_idx);
+    const resolved = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 7);
+    try std.testing.expectEqual(4, resolved.?.field_idx);
 }
 
 test "resolve simple struct field - braceless" {
@@ -2842,8 +3014,8 @@ test "resolve simple struct field - braceless" {
     const schema_ast: Ast = try .init(gpa, schema_src);
     defer schema_ast.deinit(gpa);
 
-    const schema_idx = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 2);
-    try std.testing.expectEqual(4, schema_idx);
+    const resolved = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 2);
+    try std.testing.expectEqual(4, resolved.?.field_idx);
 }
 
 test "resolve value in struct" {
@@ -2871,8 +3043,8 @@ test "resolve value in struct" {
     const schema_ast: Ast = try .init(gpa, schema_src);
     defer schema_ast.deinit(gpa);
 
-    const schema_idx = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 13);
-    try std.testing.expectEqual(5, schema_idx);
+    const resolved = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 13);
+    try std.testing.expectEqual(4, resolved.?.field_idx);
 }
 
 test "resolve value in nested struct - value" {
@@ -2904,8 +3076,8 @@ test "resolve value in nested struct - value" {
     const schema_ast: Ast = try .init(gpa, schema_src);
     defer schema_ast.deinit(gpa);
 
-    const schema_idx = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 13);
-    try std.testing.expectEqual(6, schema_idx);
+    const resolved = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 13);
+    try std.testing.expectEqual(4, resolved.?.field_idx);
 }
 
 test "resolve value in nested struct" {
@@ -2937,8 +3109,8 @@ test "resolve value in nested struct" {
     const schema_ast: Ast = try .init(gpa, schema_src);
     defer schema_ast.deinit(gpa);
 
-    const schema_idx = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 16);
-    try std.testing.expectEqual(7, schema_idx);
+    const resolved = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 16);
+    try std.testing.expectEqual(7, resolved.?.field_idx);
 }
 
 test "resolve value in dict" {
@@ -2962,8 +3134,8 @@ test "resolve value in dict" {
     const schema_ast: Ast = try .init(gpa, schema_src);
     defer schema_ast.deinit(gpa);
 
-    const schema_idx = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 5);
-    try std.testing.expectEqual(2, schema_idx);
+    const resolved = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 5);
+    try std.testing.expectEqual(1, resolved.?.field_idx);
 }
 
 test "resolve value in dict value" {
@@ -2990,8 +3162,8 @@ test "resolve value in dict value" {
     const schema_ast: Ast = try .init(gpa, schema_src);
     defer schema_ast.deinit(gpa);
 
-    const schema_idx = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 16);
-    try std.testing.expectEqual(4, schema_idx);
+    const resolved = schema_ast.resolveZiggyOffset(schema_src, ziggy_ast, ziggy_src, 16);
+    try std.testing.expectEqual(4, resolved.?.field_idx);
 }
 
 test "validate structs" {

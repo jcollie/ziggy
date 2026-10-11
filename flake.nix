@@ -33,14 +33,14 @@
     {
       packages = forAllSystems (pkgs: {
         ziggy = pkgs.stdenv.mkDerivation {
-          name = "ziggy";
-          version = "0.0.0";
+          pname = "ziggy";
+          version = "0.2.0";
           outputs = [
             "out"
             "tree_sitter"
           ];
           src = ./.;
-          nativeBuildInputs = [ pkgs.zig_0_16 ];
+          nativeBuildInputs = [ pkgs.zig_0_17 ];
           zigBuildFlags = [
             "--system"
             "${pkgs.callPackage ./build.zig.zon.nix { }}"
@@ -58,7 +58,7 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           buildInputs = [
-            pkgs.zig_0_16
+            pkgs.zig_0_17
             zon2nix.packages.${pkgs.stdenv.hostPlatform.system}.zon2nix
           ];
         };

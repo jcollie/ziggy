@@ -2,11 +2,11 @@
   "nodes": {
     "nixpkgs": {
       "locked": {
-        "lastModified": 1778036283,
-        "narHash": "sha256-GW2cEd/cLcVbbCes8iQuoY2qGIeCA7UiaD351hpkXfI=",
-        "rev": "ed67bc86e84e51d4a88e73c7fd36006dc876476f",
+        "lastModified": 1791487292,
+        "narHash": "sha256-6BIvCXtdLW4HQwsOGkgH444aB3vCbHypE9TA78ireh8=",
+        "rev": "8edc0c72e3a38faf5434e40d1f19431125fe4b30",
         "type": "tarball",
-        "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.05pre993032.ed67bc86e84e/nixexprs.tar.xz"
+        "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1088030.8edc0c72e3a3/nixexprs.tar.xz"
       },
       "original": {
         "type": "tarball",
@@ -26,11 +26,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1778078000,
-        "narHash": "sha256-0djKIL0E8Y1W495bzIkmbCub571ubghZx3Fg7xQPNrk=",
+        "lastModified": 1791659493,
+        "narHash": "sha256-nI8II51oJX/Eakii8lwDevDi3K7ZqC32RLhLJ21LZ2M=",
         "owner": "jcollie",
         "repo": "zon2nix",
-        "rev": "a9f46c6fe9177135a3001e26ec76715bb998c6cf",
+        "rev": "80f279b5218a1a8ac5bca082685daad8889c4250",
         "type": "github"
       },
       "original": {

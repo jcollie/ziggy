@@ -61,12 +61,79 @@ pub const Token = struct {
         bytes_line,
         integer,
         float,
+        nan,
+        pos_inf,
+        neg_inf,
         null,
         true,
         false,
         comment_line,
         eod, // ---, ```, or </script>
         eof,
+
+        pub fn literal(t: Tag) []const u8 {
+            return switch (t) {
+                .comment_line,
+                .eod,
+                .eof,
+                .bytes,
+                .bytes_line,
+                .integer,
+                .float,
+                .union_case,
+                .invalid,
+                .identifier,
+                => unreachable,
+                .comma => ",",
+                .eql => "=",
+                .colon => ":",
+                .rp => ")",
+                .dotlb => ".{",
+                .lb => "{",
+                .rb => "}",
+                .lsb => "[",
+                .rsb => "]",
+                .nan => "nan",
+                .pos_inf => "inf",
+                .neg_inf => "-inf",
+                .null => "null",
+                .true => "true",
+                .false => "false",
+            };
+        }
+
+        pub const Kind = enum {
+            punctuation,
+            comment_line,
+            bytes,
+            bytes_line,
+            integer,
+            float,
+            identifier,
+            eod,
+            null,
+            bool,
+            @"enum",
+        };
+
+        pub fn kind(t: Tag) Kind {
+            return switch (t) {
+                .eof,
+                .invalid,
+                .union_case, // we always split it
+                => unreachable,
+                .comma, .eql, .colon, .rp, .dotlb, .lb, .rb, .lsb, .rsb => .punctuation,
+                .comment_line => .comment_line,
+                .bytes => .bytes,
+                .bytes_line => .bytes_line,
+                .integer => .integer,
+                .float, .nan, .pos_inf, .neg_inf => .float,
+                .identifier => .identifier,
+                .null => .null,
+                .true, .false => .bool,
+                .eod => .eod,
+            };
+        }
     };
 
     pub const Loc = struct {
@@ -75,6 +142,21 @@ pub const Token = struct {
 
         pub fn slice(loc: Loc, src: [:0]const u8) []const u8 {
             return src[loc.start..loc.end];
+        }
+
+        pub const Line = struct { line: []const u8, start: u32 };
+        pub fn line(loc: Loc, src: []const u8) Line {
+            var idx = @min(loc.start, src.len - 2);
+            const s = while (idx > 0) : (idx -= 1) {
+                if (src[idx] == '\n') break idx + 1;
+            } else 0;
+
+            idx = loc.end;
+            const e = while (idx < src.len) : (idx += 1) {
+                if (src[idx] == '\n') break idx;
+            } else src.len - 1;
+
+            return .{ .line = src[s..e], .start = s };
         }
 
         pub const Selection = struct {
@@ -88,7 +170,6 @@ pub const Token = struct {
         };
 
         pub fn getSelection(loc: Loc, code: [:0]const u8) Selection {
-            //TODO: ziglyph
             var selection: Selection = .{
                 .start = .{ .line = 1, .col = 1 },
                 .end = undefined,
@@ -251,6 +332,11 @@ pub fn next(t: *Tokenizer, src: [:0]const u8, skip_comments: bool) Token {
                     tok.loc.end = t.idx + 3;
                     t.idx = @intCast(src.len);
                     return tok;
+                } else if (std.mem.startsWith(u8, src[t.idx..], "-inf")) {
+                    tok.tag = .neg_inf;
+                    tok.loc.end = t.idx + 4;
+                    t.idx += 4;
+                    return tok;
                 }
 
                 continue :state .number;
@@ -299,6 +385,10 @@ pub fn next(t: *Tokenizer, src: [:0]const u8, skip_comments: bool) Token {
                     tok.tag = .false;
                 } else if (std.mem.eql(u8, slice, "null")) {
                     tok.tag = .null;
+                } else if (std.mem.eql(u8, slice, "nan")) {
+                    tok.tag = .nan;
+                } else if (std.mem.eql(u8, slice, "inf")) {
+                    tok.tag = .pos_inf;
                 } else tok.tag = .invalid;
 
                 return tok;
@@ -349,10 +439,23 @@ pub fn next(t: *Tokenizer, src: [:0]const u8, skip_comments: bool) Token {
             },
 
             '"' => {
-                const slice = src[0..t.idx];
-                t.idx += 1;
-                if (!evenSlashes(slice)) continue :state .bytes;
-                tok.tag = .bytes;
+                {
+                    const slice = src[0..t.idx];
+                    t.idx += 1;
+                    if (!evenSlashes(slice)) continue :state .bytes;
+                }
+
+                const slice = src[tok.loc.start..t.idx];
+                var discard: std.Io.Writer.Discarding = .init(&.{});
+                const tag: Token.Tag = switch (std.zig.string_literal.parseWrite(
+                    &discard.writer,
+                    slice,
+                ) catch std.zig.string_literal.Result{ .failure = .empty_char_literal }) {
+                    .success => .bytes,
+                    .failure => .invalid,
+                };
+
+                tok.tag = tag;
                 tok.loc.end = t.idx;
                 return tok;
             },
@@ -367,6 +470,11 @@ pub fn next(t: *Tokenizer, src: [:0]const u8, skip_comments: bool) Token {
             '\\' => {
                 t.idx += 1;
                 continue :state .bytes_line;
+            },
+            0 => {
+                tok.tag = .invalid;
+                tok.loc.end = t.idx;
+                return tok;
             },
             else => {
                 t.idx += 1;
@@ -394,6 +502,11 @@ pub fn next(t: *Tokenizer, src: [:0]const u8, skip_comments: bool) Token {
 
         .comment_start => switch (src[t.idx]) {
             '/' => continue :state .comment,
+            0 => {
+                tok.tag = .invalid;
+                tok.loc.end = t.idx;
+                return tok;
+            },
             else => {
                 t.idx += 1;
                 continue :state .invalid;
@@ -435,8 +548,8 @@ pub fn next(t: *Tokenizer, src: [:0]const u8, skip_comments: bool) Token {
                 continue :state .invalid;
             },
             else => {
+                if (src[t.idx] != 0) t.idx += 1;
                 tok.loc.end = t.idx;
-
                 tok.tag = .invalid;
                 return tok;
             },
@@ -448,17 +561,19 @@ pub fn next(t: *Tokenizer, src: [:0]const u8, skip_comments: bool) Token {
 
 fn finishNumber(t: Tokenizer, tok: *Token, src: [:0]const u8) void {
     tok.loc.end = t.idx;
-    // TODO: implement this natively
-    var minus_minus = tok.loc;
-    if (minus_minus.slice(src)[0] == '-') {
-        minus_minus.start += 1;
-    }
-    const check = std.zig.parseNumberLiteral(minus_minus.slice(src));
-    tok.tag = switch (check) {
-        .failure => .invalid,
-        .int, .big_int => .integer,
-        .float => .float,
+    const n = tok.loc.slice(src);
+
+    _ = std.fmt.parseInt(i64, n, 0) catch {
+        _ = std.fmt.parseFloat(f32, n) catch {
+            tok.tag = .invalid;
+            return;
+        };
+
+        tok.tag = .float;
+        return;
     };
+
+    tok.tag = .integer;
 }
 
 fn evenSlashes(str: []const u8) bool {
@@ -654,4 +769,19 @@ test "comment in array" {
     }, false, .none);
     // zig fmt: on
 
+}
+
+test "special float values" {
+    // zig fmt: off
+    try testCase(
+        \\.pos_inf1 = inf,
+        \\.neg_inf = -inf,
+        \\.nan = nan
+    , &.{
+        .identifier, .eql, .pos_inf, .comma,
+        .identifier, .eql, .neg_inf, .comma,
+        .identifier, .eql, .nan,
+        .eof,
+    }, false, .none);
+    // zig fmt: on
 }

@@ -4,6 +4,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Writer = std.Io.Writer;
 const Allocator = std.mem.Allocator;
+const ansi = @import("ansi_term");
+const root = @import("root.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const Token = Tokenizer.Token;
 const Loc = Token.Loc;
@@ -13,6 +15,7 @@ const log = std.log.scoped(.ziggy_ast);
 nodes: []const Node,
 errors: []const Error,
 has_syntax_errors: bool,
+delimiter: Tokenizer.Delimiter,
 
 pub const FieldKind = enum { @"struct", dict };
 pub const Error = struct {
@@ -78,13 +81,37 @@ pub const Node = struct {
         //The following tags are never present in correct documents
         struct_v_fixup,
         missing_value,
+
+        /// Only valid on single-token nodes.
+        fn kind(t: Tag) Tokenizer.Token.Tag.Kind {
+            return switch (t) {
+                .root,
+                .braceless_struct,
+                .struct_h,
+                .struct_v,
+                .dict_h,
+                .dict_v,
+                .array_h,
+                .array_v,
+                .struct_field,
+                .dict_field,
+                .array_element,
+                .@"union",
+                .bytes_multiline,
+                .struct_v_fixup,
+                .missing_value,
+                => unreachable,
+
+                .@"enum" => .@"enum",
+                .bytes => .bytes,
+                .integer => .integer,
+                .float => .float,
+                .bool => .bool,
+                .null => .null,
+            };
+        }
     };
 };
-
-pub fn deinit(ast: Ast, gpa: Allocator) void {
-    gpa.free(ast.nodes);
-    gpa.free(ast.errors);
-}
 
 pub const Options = struct {
     /// When parsing a SuperMD frontmatter, set to `.dashes`.
@@ -101,6 +128,37 @@ pub fn init(
     var p: Parser = .{ .gpa = gpa, .src = src, .options = options };
     defer p.deinit();
     return p.parse();
+}
+
+pub fn deinit(ast: Ast, gpa: Allocator) void {
+    gpa.free(ast.nodes);
+    gpa.free(ast.errors);
+}
+
+pub fn fieldName(ast: *const Ast, src: [:0]const u8, node_idx: u32) []const u8 {
+    const node = ast.nodes[node_idx];
+    assert(node.tag == .struct_field or node.tag == .dict_field);
+    var t: Tokenizer = .{
+        .idx = node.loc.start,
+        .lines = 0,
+        .delimiter = ast.delimiter,
+    };
+
+    const name_tok = t.next(src, true);
+    const txt = name_tok.loc.slice(src);
+    return switch (name_tok.tag) {
+        .identifier => txt[1..],
+        .bytes => txt[1 .. txt.len - 1],
+        else => unreachable,
+    };
+}
+
+pub fn iterator(ast: *const Ast) Iterator {
+    return .{ .nodes = ast.nodes };
+}
+
+pub fn fmt(ast: *const Ast, src: [:0]const u8, rm: root.RenderMode) Format {
+    return .{ .src = src, .ast = ast, .rm = rm };
 }
 
 const Parser = struct {
@@ -232,6 +290,10 @@ const Parser = struct {
                     },
                     .eof, .eod => {
                         if (p.tok.tag == .comma) p.consume();
+                        try p.err(.{
+                            .tag = .{ .missing_token = "'}'" },
+                            .main_location = p.tok.loc,
+                        });
                         return p.finalize();
                     },
                     .identifier, .bytes => true,
@@ -268,41 +330,85 @@ const Parser = struct {
                 }
             },
             .struct_field, .dict_field => if (p.curIsEmpty()) {
-                var skip_separator = false;
-                switch (p.cur().tag) {
-                    .struct_field => if (p.tok.tag == .bytes) {
-                        const peek_tok = p.peek();
-                        try p.err(.{
-                            .tag = if (peek_tok == .colon) .wrong_field_style else .unexpected_token,
+                switch (p.tok.tag) {
+                    .identifier => {},
+                    .bytes => {
+                        if (p.tok.loc.end - p.tok.loc.start < 3) try p.err(.{
+                            .tag = .empty_dict_key,
                             .main_location = p.tok.loc,
                         });
-                        p.nodes.items[p.cur().parent_idx].tag = .struct_v_fixup;
-                        skip_separator = true;
                     },
-                    .dict_field => if (p.tok.tag == .identifier) {
-                        const peek_tok = p.peek();
-                        try p.err(.{
-                            .tag = if (peek_tok == .eql) .wrong_field_style else .unexpected_token,
-                            .main_location = p.tok.loc,
-                        });
-                        skip_separator = true;
+                    .eof, .eod => {
+                        // we should not be able to get here without errors
+                        assert(p.errors.items.len > 0);
+                        return p.finalize();
                     },
-                    else => unreachable,
+                    else => {
+                        // we should not be able to get here without errors
+                        assert(p.errors.items.len > 0);
+                    },
                 }
 
-                if (p.tok.tag == .bytes) {
-                    if (p.tok.loc.end - p.tok.loc.start < 3) try p.err(.{
-                        .tag = .empty_dict_key,
+                const style_mismatch = switch (p.cur().tag) {
+                    .struct_field => p.tok.tag == .bytes,
+                    .dict_field => p.tok.tag == .identifier,
+                    else => unreachable,
+                };
+
+                if (style_mismatch) {
+                    try p.err(.{
+                        .tag = .wrong_field_style,
                         .main_location = p.tok.loc,
                     });
+
+                    if (p.cur().tag == .struct_field) {
+                        p.nodes.items[p.cur().parent_idx].tag = .struct_v_fixup;
+                    }
                 }
 
                 p.consume();
-                try p.beginField(skip_separator, switch (p.cur().tag) {
-                    .struct_field => .@"struct",
-                    .dict_field => .dict,
-                    else => unreachable,
-                });
+                switch (p.tok.tag) {
+                    .colon, .eql => if (!style_mismatch) {
+                        if ((p.cur().tag == .struct_field and p.tok.tag == .colon) or
+                            (p.cur().tag == .dict_field and p.tok.tag == .eql))
+                        {
+                            try p.err(.{
+                                .tag = .unexpected_token,
+                                .main_location = p.tok.loc,
+                            });
+                        }
+                    },
+                    .eod, .eof => {
+                        try p.err(.{
+                            .tag = .{
+                                .missing_token = switch (p.cur().tag) {
+                                    .struct_field => "'=' after struct field name",
+                                    .dict_field => "':' after dict field name",
+                                    else => unreachable,
+                                },
+                            },
+                            .main_location = p.prev_loc,
+                        });
+                        return p.finalize();
+                    },
+                    else => {
+                        try p.err(.{
+                            .tag = .{
+                                .missing_token = switch (p.cur().tag) {
+                                    .struct_field => "'=' after struct field name",
+                                    .dict_field => "':' after dict field name",
+                                    else => unreachable,
+                                },
+                            },
+                            .main_location = p.prev_loc,
+                        });
+                        try p.discardUntilRestart();
+                        continue :parse p.cur().tag;
+                    },
+                }
+
+                p.consume();
+                try p.beginValue();
                 continue :parse p.cur().tag;
             } else {
                 // missing commas are handled by the container
@@ -330,8 +436,8 @@ const Parser = struct {
                             .tag = .{ .missing_token = "']' after last array element" },
                             .main_location = p.prev_loc,
                         });
-                        p.cur().loc.end = p.tok.loc.start;
-                        p.up();
+                        // p.cur().loc.end = p.tok.loc.start;
+                        // p.up();
                         return p.finalize();
                     },
                     else => {},
@@ -386,41 +492,6 @@ const Parser = struct {
         comptime unreachable;
     }
 
-    fn beginField(p: *Parser, skip_separator: bool, kind: FieldKind) !void {
-        if (!skip_separator) switch (p.tok.tag) {
-            .eql => {
-                if (kind == .dict) try p.err(.{
-                    .tag = .{ .wrong_field_separator = kind },
-                    .main_location = p.tok.loc,
-                });
-            },
-            .colon => {
-                if (kind != .dict) try p.err(.{
-                    .tag = .{ .wrong_field_separator = kind },
-                    .main_location = p.tok.loc,
-                });
-            },
-            else => {
-                try p.err(.{
-                    .tag = .{
-                        .missing_token = switch (kind) {
-                            .@"struct" => "'=' after struct field name",
-                            .dict => "':' after dict field name",
-                        },
-                    },
-                    .main_location = p.prev_loc,
-                });
-                try p.beginValue();
-                return;
-            },
-        };
-
-        p.consume();
-        log.debug("found field delimiter, parsing value from {any}", .{p.tok});
-        try p.beginValue();
-        return;
-    }
-
     fn beginValue(p: *Parser) !void {
         switch (p.tok.tag) {
             .dotlb => {
@@ -469,6 +540,11 @@ const Parser = struct {
                 p.cur().loc.end = p.tok.loc.end;
                 p.up();
             },
+            .pos_inf, .neg_inf, .nan => {
+                try p.addChild(.float);
+                p.cur().loc.end = p.tok.loc.end;
+                p.up();
+            },
             .true, .false => {
                 try p.addChild(.bool);
                 p.cur().loc.end = p.tok.loc.end;
@@ -480,18 +556,20 @@ const Parser = struct {
                 p.up();
             },
             else => {
-                if (p.tok.tag == .invalid) try p.err(.{
-                    .tag = .unexpected_token,
-                    .main_location = p.tok.loc,
-                }) else try p.err(.{
+                if (p.tok.tag == .invalid) {
+                    try p.err(.{
+                        .tag = .unexpected_token,
+                        .main_location = p.tok.loc,
+                    });
+                } else try p.err(.{
                     .tag = .missing_value,
                     .main_location = p.prev_loc,
                 });
 
                 try p.addChild(.missing_value);
                 p.cur().loc = .{
-                    .start = p.prev_loc.start,
-                    .end = p.tok.loc.start,
+                    .start = p.prev_loc.end,
+                    .end = p.tok.loc.end,
                 };
                 p.up();
                 try p.discardUntilRestart();
@@ -529,7 +607,12 @@ const Parser = struct {
             .dict_field,
             => switch (p.tok.tag) {
                 .eof, .eod => return,
-                .comma, .identifier, .bytes, .rb => {
+                .comma => {
+                    p.cur().loc.end = p.tok.loc.end;
+                    p.up();
+                    continue :discard p.cur().tag;
+                },
+                .identifier, .bytes, .rb => {
                     p.cur().loc.end = p.tok.loc.start;
                     p.up();
                     continue :discard p.cur().tag;
@@ -561,7 +644,7 @@ const Parser = struct {
                 .eof, .eod => return,
                 else => {
                     p.cur().loc.end = p.tok.loc.start;
-                    log.debug("cur = {any}", .{p.cur().*});
+                    // log.debug("cur = {any}", .{p.cur().*});
                     p.up();
                     continue :discard .array_v;
                 },
@@ -601,7 +684,7 @@ const Parser = struct {
         assert(p.tok.tag != .eod);
         p.prev_loc = p.tok.loc;
         p.tok = p.tokenizer.next(p.src, true);
-        log.debug("new tok: {any}", .{p.tok});
+        // log.debug("new tok: [{t}] '{s}'", .{ p.tok.tag, p.tok.loc.slice(p.src) });
     }
 
     fn consumeAllowTopLevelComment(p: *Parser) void {
@@ -609,7 +692,7 @@ const Parser = struct {
         assert(p.tok.tag != .eod);
         p.prev_loc = p.tok.loc;
         p.tok = p.tokenizer.next(p.src);
-        log.debug("new tok: {any}", .{p.tok});
+        // log.debug("[tlc] new tok: [{t}] '{s}'", .{ p.tok.tag, p.tok.loc.slice(p.src) });
     }
 
     fn peek(p: *Parser) Token.Tag {
@@ -637,14 +720,14 @@ const Parser = struct {
 
     fn up(p: *Parser) void {
         const current = p.cur();
-        std.log.debug("up cur {any} tok {any}", .{ p.cur().*, p.tok });
+        // std.log.debug("up cur {any} tok {any}", .{ p.cur().*, p.tok });
         assert(current.loc.end >= current.loc.start);
         assert(current.loc.end <= p.src.len);
         p.node_idx = p.cur().parent_idx;
     }
 
     fn err(p: *Parser, e: Error) !void {
-        log.debug("err: {any}", .{e});
+        // log.debug("err: {any}", .{e});
         switch (e.tag) {
             .wrong_field_separator,
             .wrong_field_style,
@@ -669,14 +752,15 @@ const Parser = struct {
 
         while (true) {
             p.cur().loc.end = p.tok.loc.start;
-            p.up();
             if (p.node_idx == 0) break;
+            p.up();
         }
 
         return .{
             .nodes = try p.nodes.toOwnedSlice(p.gpa),
             .errors = try p.errors.toOwnedSlice(p.gpa),
             .has_syntax_errors = p.has_syntax_errors,
+            .delimiter = p.options.delimiter,
         };
     }
 };
@@ -814,28 +898,22 @@ pub const Iterator = struct {
     }
 };
 
-pub fn iterator(ast: Ast) Iterator {
-    return .{ .nodes = ast.nodes };
-}
-
 pub const Format = struct {
     src: [:0]const u8,
-    ast: Ast,
+    ast: *const Ast,
+    rm: root.RenderMode,
 
     pub fn format(f: Format, w: *Writer) !void {
-        try f.ast.render(f.src, w);
+        try f.ast.render(f.src, f.rm, w);
     }
 };
-
-pub fn fmt(ast: Ast, src: [:0]const u8) Format {
-    return .{ .src = src, .ast = ast };
-}
 
 fn renderComments(
     at_newline: *bool,
     indent: u32,
     last_end: u32,
     src: [:0]const u8,
+    r: *Renderer,
     w: *Writer,
 ) !void {
     var t: Tokenizer = .{ .idx = last_end, .delimiter = .none, .lines = 0 };
@@ -855,7 +933,7 @@ fn renderComments(
         } else {
             try w.splatByteAll(' ', indent * 4);
         }
-        try w.print("{s}", .{tok.loc.slice(src)});
+        try r.token(tok);
         try w.writeAll("\n");
     }
     at_newline.* |= !first;
@@ -879,7 +957,229 @@ fn fixupApplies(f: ?Fixup, offset: u32) bool {
     return false;
 }
 
-pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
+const Renderer = struct {
+    w: *Writer,
+    src: [:0]const u8,
+    mode: root.RenderMode,
+    // used for syntax-highlighting in the terminal
+    ansi_style: ansi.style.Style = .{},
+
+    fn lit(r: *Renderer, t: Tokenizer.Token.Tag) !void {
+        switch (r.mode) {
+            .plain => try r.w.writeAll(t.literal()),
+            .html => {
+                try r.w.print("<{0s}>{1s}</{0s}>", .{
+                    htmlTag(t.kind()),
+                    t.literal(),
+                });
+            },
+            .terminal => {
+                try r.styleUpdate(t.kind());
+                try r.w.writeAll(t.literal());
+                try r.styleClean();
+            },
+        }
+    }
+
+    fn token(r: *Renderer, tok: Tokenizer.Token) !void {
+        if (tok.tag == .union_case) return r.union_case(tok);
+
+        const tok_src = tok.loc.slice(r.src);
+        switch (r.mode) {
+            .plain => try r.w.writeAll(tok_src),
+            .html => {
+                try r.w.print("<{0s}>{1s}</{0s}>", .{
+                    htmlTag(tok.tag.kind()),
+                    tok_src,
+                });
+            },
+            .terminal => {
+                try r.styleUpdate(tok.tag.kind());
+                try r.w.writeAll(tok_src);
+                try r.styleClean();
+            },
+        }
+    }
+
+    fn node(r: *Renderer, n: *const Node) !void {
+        const node_src = n.loc.slice(r.src);
+        switch (r.mode) {
+            .plain => try r.w.print("{s}", .{node_src}),
+            .html => {
+                try r.w.print("<{0s}>{1s}</{0s}>", .{
+                    htmlTag(n.tag.kind()),
+                    node_src,
+                });
+            },
+            .terminal => {
+                try r.styleUpdate(n.tag.kind());
+                try r.w.writeAll(node_src);
+                try r.styleClean();
+            },
+        }
+    }
+
+    fn identifier(r: *Renderer, name: []const u8) !void {
+        switch (r.mode) {
+            .plain => try r.w.print(".{s}", .{name}),
+            .html => {
+                try r.w.print("<{0s}>.{1s}</{0s}>", .{
+                    htmlTag(.identifier),
+                    name,
+                });
+            },
+            .terminal => {
+                try r.styleUpdate(.identifier);
+                try r.w.print(".{s}", .{name});
+                try r.styleClean();
+            },
+        }
+    }
+
+    fn union_case(r: *Renderer, tok: Tokenizer.Token) !void {
+        const tok_src = tok.loc.slice(r.src);
+        const case = tok_src[0 .. tok_src.len - 1];
+
+        switch (r.mode) {
+            .plain => try r.w.writeAll(case),
+            .html => {
+                try r.w.print("<{0s}>{1s}</{0s}>", .{
+                    htmlTag(.@"enum"),
+                    case,
+                });
+            },
+            .terminal => {
+                try r.styleUpdate(.@"enum");
+                try r.w.writeAll(case);
+                try r.styleClean();
+            },
+        }
+
+        try r.left_paren();
+    }
+
+    fn bytes(r: *Renderer, b: []const u8) !void {
+        switch (r.mode) {
+            .plain => try r.w.print("\"{s}\"", .{b}),
+            .html => {
+                try r.w.print("<{0s}>\"{1s}\"</{0s}>", .{
+                    htmlTag(.bytes),
+                    b,
+                });
+            },
+            .terminal => {
+                try r.styleUpdate(.bytes);
+                try r.w.print("\"{s}\"", .{b});
+                try r.styleClean();
+            },
+        }
+    }
+
+    fn left_paren(r: *Renderer) !void {
+        switch (r.mode) {
+            .plain => try r.w.writeByte('('),
+            .html => {
+                try r.w.print("<{0s}>(</{0s}>", .{
+                    htmlTag(.punctuation),
+                });
+            },
+            .terminal => {
+                try r.styleUpdate(.punctuation);
+                try r.w.writeByte('(');
+                try r.styleClean();
+            },
+        }
+    }
+
+    fn htmlTag(k: Tokenizer.Token.Tag.Kind) []const u8 {
+        return switch (k) {
+            .punctuation => "z-p",
+            .identifier => "z-i",
+            .bool => "z-b",
+            .null => "z-n",
+            .comment_line => "z-c",
+            .bytes, .bytes_line => "z-b",
+            .integer, .float => "z-n",
+            .eod => "z-d",
+            .@"enum" => "z-e",
+        };
+    }
+
+    fn styleUpdate(r: *Renderer, k: Tokenizer.Token.Tag.Kind) !void {
+        var new: ansi.style.Style = .{};
+
+        switch (k) {
+            .punctuation => {},
+            .identifier => {},
+            .bool => {
+                new.foreground = .Red;
+                new.font_style = .{
+                    .bold = true,
+                };
+            },
+            .null => {
+                new.foreground = .Blue;
+                new.font_style = .{
+                    .bold = true,
+                };
+            },
+            .comment_line => {
+                new.font_style = .{
+                    .italic = true,
+                    .dim = true,
+                };
+            },
+            .bytes, .bytes_line => {
+                new.foreground = .Yellow;
+            },
+            .integer, .float => {
+                new.foreground = .Blue;
+            },
+            .eod, .@"enum" => {
+                new.foreground = .Yellow;
+                new.font_style = .{
+                    .bold = true,
+                };
+            },
+        }
+
+        try ansi.format.updateStyle(r.w, new, r.ansi_style);
+        r.ansi_style = new;
+    }
+
+    fn styleClean(r: *Renderer) !void {
+        var clean = r.ansi_style;
+        clean.font_style = .{};
+        try ansi.format.updateStyle(r.w, clean, r.ansi_style);
+        r.ansi_style = clean;
+    }
+
+    fn done(r: *Renderer) void {
+        switch (r.mode) {
+            .terminal => {
+                ansi.format.updateStyle(r.w, .{}, r.ansi_style) catch {};
+                r.ansi_style = undefined;
+            },
+            else => {},
+        }
+    }
+};
+
+/// Formats the Ast and applies fixups. An Ast can have errors and still be
+/// formatted but none of the errors can be a syntax error.
+///
+/// Asserts that `ast.has_syntax_errors` is false.
+pub fn render(ast: Ast, src: [:0]const u8, mode: root.RenderMode, w: *Writer) Writer.Error!void {
+    assert(!ast.has_syntax_errors);
+
+    var r: Renderer = .{
+        .w = w,
+        .src = src,
+        .mode = mode,
+    };
+
+    defer r.done();
+
     const nodes = ast.nodes;
 
     if (ast.nodes[0].loc.start != 0) {
@@ -892,7 +1192,7 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
     var indent: u32 = 0;
     var array_start = false;
     var at_newline = true;
-    try renderComments(&at_newline, indent, 0, src, w);
+    try renderComments(&at_newline, indent, 0, src, &r, w);
     while (true) {
         const ev = it.next();
         switch (ev) {
@@ -907,27 +1207,33 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
                             else => unreachable,
                         }
 
-                        const open_tok = switch (node.tag) {
-                            .struct_h, .struct_v, .struct_v_fixup => ".{",
-                            .dict_h, .dict_v => "{",
+                        const open_tag: Token.Tag = switch (node.tag) {
+                            .struct_h, .struct_v, .struct_v_fixup => .dotlb,
+                            .dict_h, .dict_v => .lb,
                             else => unreachable,
                         };
-                        try w.writeAll(open_tok);
+
+                        try r.lit(open_tag);
                         at_newline = false;
                         try renderComments(
                             &at_newline,
                             indent,
-                            @intCast(node.loc.start + open_tok.len),
+                            @intCast(node.loc.start + switch (open_tag) {
+                                .dotlb => @as(u32, 2),
+                                .lb => @as(u32, 1),
+                                else => unreachable,
+                            }),
                             src,
+                            &r,
                             w,
                         );
                     },
                     .array_h, .array_v => {
                         array_start = true;
                         indent += @intFromBool(node.tag == .array_v);
-                        try w.writeAll("[");
+                        try r.lit(.lsb);
                         at_newline = false;
-                        try renderComments(&at_newline, indent, node.loc.start + 1, src, w);
+                        try renderComments(&at_newline, indent, node.loc.start + 1, src, &r, w);
                     },
                     .struct_field, .dict_field => {
                         var t: Tokenizer = .{
@@ -938,10 +1244,10 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
                         const parent_tag = nodes[node.parent_idx].tag;
                         switch (parent_tag) {
                             .braceless_struct, .struct_v, .struct_v_fixup, .dict_v => {
-                                if (!at_newline) try w.writeAll("\n");
+                                if (!at_newline) try w.writeByte('\n');
                                 try w.splatByteAll(' ', indent * 4);
                             },
-                            .struct_h, .dict_h => try w.writeAll(" "),
+                            .struct_h, .dict_h => try w.writeByte(' '),
                             else => unreachable,
                         }
 
@@ -956,25 +1262,20 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
                             switch (parent_tag) {
                                 .braceless_struct, .struct_h, .struct_v, .struct_v_fixup => {
                                     const slice = field_name.loc.slice(src);
-                                    try w.print(".{s}", .{slice[1 .. slice.len - 1]});
+                                    try r.identifier(slice[1 .. slice.len - 1]);
                                 },
                                 .dict_v, .dict_h => {
                                     const slice = field_name.loc.slice(src);
-                                    try w.print("\"{s}\"", .{slice[1..]});
+                                    try r.bytes(slice[1..]);
                                 },
                                 else => unreachable,
                             }
                             at_newline = false;
-                            try renderComments(&at_newline, indent, field_name.loc.end, src, w);
+                            try renderComments(&at_newline, indent, field_name.loc.end, src, &r, w);
                             if (at_newline) try w.splatByteAll(' ', indent * 4);
-                            assert(field_separator.tag == switch (parent_tag) {
-                                .braceless_struct,
-                                .struct_h,
-                                .struct_v,
-                                .struct_v_fixup,
-                                => Token.Tag.colon,
-                                .dict_v, .dict_h => Token.Tag.eql,
-                                else => unreachable,
+                            assert(switch (field_separator.tag) {
+                                .colon, .eql => true,
+                                else => false,
                             });
 
                             next_fixup = ast.nextFixup(next_fixup.?.idx);
@@ -988,24 +1289,26 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
                                 .dict_v, .dict_h => Token.Tag.bytes,
                                 else => unreachable,
                             });
-                            try w.writeAll(field_name.loc.slice(src));
+                            try r.token(field_name);
                             at_newline = false;
-                            try renderComments(&at_newline, indent, field_name.loc.end, src, w);
+                            try renderComments(&at_newline, indent, field_name.loc.end, src, &r, w);
                             if (at_newline) try w.splatByteAll(' ', indent * 4);
-                            assert(field_separator.tag == switch (parent_tag) {
-                                .braceless_struct, .struct_h, .struct_v, .struct_v_fixup => Token.Tag.eql,
-                                .dict_v, .dict_h => Token.Tag.colon,
-                                else => unreachable,
+                            assert(switch (field_separator.tag) {
+                                .colon, .eql => true,
+                                else => false,
                             });
                         }
 
-                        try w.writeAll(switch (parent_tag) {
-                            .braceless_struct, .struct_h, .struct_v, .struct_v_fixup => " =",
-                            .dict_v, .dict_h => ":",
+                        switch (parent_tag) {
+                            .braceless_struct, .struct_h, .struct_v, .struct_v_fixup => {
+                                try w.writeByte(' ');
+                                try r.lit(.eql);
+                            },
+                            .dict_v, .dict_h => try r.lit(.colon),
                             else => unreachable,
-                        });
+                        }
                         at_newline = false;
-                        try renderComments(&at_newline, indent, field_separator.loc.end, src, w);
+                        try renderComments(&at_newline, indent, field_separator.loc.end, src, &r, w);
                         try w.splatByteAll(' ', if (at_newline) indent * 4 else 1);
                     },
                     .array_element => {
@@ -1024,9 +1327,9 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
                         };
                         const case = t.next(src, true);
                         assert(case.tag == .union_case);
-                        try w.writeAll(case.loc.slice(src));
+                        try r.token(case);
                         at_newline = false;
-                        try renderComments(&at_newline, indent, case.loc.end, src, w);
+                        try renderComments(&at_newline, indent, case.loc.end, src, &r, w);
                     },
                     .bytes_multiline => {
                         var t: Tokenizer = .{
@@ -1040,11 +1343,11 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
                         }
                         while (line.loc.start < node.loc.end) : (line = t.next(src, false)) {
                             try w.splatByteAll(' ', (indent + 1) * 4);
-                            try w.writeAll(line.loc.slice(src));
+                            try r.token(line);
                             try w.writeAll("\n");
                         }
                         at_newline = true;
-                        try renderComments(&at_newline, indent, node.loc.end, src, w);
+                        try renderComments(&at_newline, indent, node.loc.end, src, &r, w);
                     },
                     .@"enum",
                     .bytes,
@@ -1053,9 +1356,9 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
                     .bool,
                     .null,
                     => {
-                        try w.writeAll(node.loc.slice(src));
+                        try r.node(node);
                         at_newline = false;
-                        try renderComments(&at_newline, indent, node.loc.end, src, w);
+                        try renderComments(&at_newline, indent, node.loc.end, src, &r, w);
                     },
                 }
             },
@@ -1068,42 +1371,59 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
                     {
                         try w.writeAll(" ");
                     }
-                    try w.writeAll("}");
+                    try r.lit(.rb);
                     at_newline = false;
+                    try renderComments(&at_newline, indent, node.loc.end, src, &r, w);
                 },
                 .struct_v, .struct_v_fixup, .dict_v => {
                     indent -= 1;
                     if (!at_newline) try w.writeAll("\n");
                     try w.splatByteAll(' ', indent * 4);
-                    try w.writeAll("}");
+                    try r.lit(.rb);
                     at_newline = false;
-                    try renderComments(&at_newline, indent, node.loc.end, src, w);
+                    try renderComments(&at_newline, indent, node.loc.end, src, &r, w);
                 },
                 .array_h => {
-                    try w.writeAll("]");
+                    try r.lit(.rsb);
                     at_newline = false;
-                    try renderComments(&at_newline, indent, node.loc.end, src, w);
+                    try renderComments(&at_newline, indent, node.loc.end, src, &r, w);
                 },
                 .array_v => {
                     indent -= 1;
                     if (!at_newline) try w.writeAll("\n");
                     try w.splatByteAll(' ', indent * 4);
-                    try w.writeAll("]");
+                    try r.lit(.rsb);
                     at_newline = false;
-                    try renderComments(&at_newline, indent, node.loc.end, src, w);
+                    try renderComments(&at_newline, indent, node.loc.end, src, &r, w);
                 },
                 .struct_field, .dict_field, .array_element => {
-                    if (src[node.loc.end - 1] == ',' or nodes[node.parent_idx].tag == .struct_v_fixup) {
+                    // Roundabout way to check if there is a comma at the
+                    // end of our field. We cannot check for a literal
+                    // comma because it might be the final char of a
+                    // multiline string.
+                    const has_comma = blk: {
+                        const node_idx = node - ast.nodes.ptr;
+                        assert(ast.nodes.len > node_idx + 1);
+                        assert(ast.nodes[node_idx + 1].parent_idx == node_idx);
+                        const child = ast.nodes[node_idx + 1];
+                        break :blk (child.loc.end != node.loc.end);
+                    };
+
+                    if (has_comma or nodes[node.parent_idx].tag == .struct_v_fixup) {
                         if (at_newline) try w.splatByteAll(' ', indent * 4);
-                        try w.writeAll(",");
+                        try r.lit(.comma);
                         at_newline = false;
                     }
-                    try renderComments(&at_newline, indent, node.loc.end, src, w);
+
+                    if (has_comma) {
+                        try renderComments(&at_newline, indent, node.loc.end, src, &r, w);
+                    }
                 },
                 .@"union" => {
-                    try w.writeAll(")");
+                    if (at_newline) try w.splatByteAll(' ', indent * 4);
+                    try r.lit(.rp);
                     at_newline = false;
-                    try renderComments(&at_newline, indent, node.loc.end, src, w);
+                    try renderComments(&at_newline, indent, node.loc.end, src, &r, w);
                 },
                 .root,
                 .missing_value,
@@ -1120,7 +1440,9 @@ pub fn render(ast: Ast, src: [:0]const u8, w: *Writer) Writer.Error!void {
             },
             .done => {
                 try w.writeAll("\n");
-                try w.writeAll(src[ast.nodes[0].loc.end..]);
+                if (ast.delimiter != .none) {
+                    try w.writeAll(src[ast.nodes[0].loc.end..]);
+                }
                 return;
             },
         }
@@ -1139,141 +1461,149 @@ test "struct - empty" {
     try std.testing.expect(ast.errors.len == 0);
 }
 
-// test "struct - empty" {
-//     const case =
-//         \\{}
-//     ;
+test "dict - empty" {
+    const case =
+        \\{}
+        \\
+    ;
 
-//     var diag: Diagnostic = .{ .path = null };
-//     errdefer std.debug.print("diag: {f}", .{diag.fmt(case)});
-//     const ast = try Ast.init(std.testing.allocator, case, true, true, false, &diag);
-//     defer ast.deinit(std.testing.allocator);
-//     try std.testing.expectFmt(case, "{f}", .{ast});
-// }
+    const ast = try Ast.init(std.testing.allocator, case, .{});
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.fmt(case, .plain)});
+}
 
-// test "array - empty" {
-//     const case =
-//         \\[]
-//     ;
+test "array - empty" {
+    const case =
+        \\[]
+        \\
+    ;
 
-//     var diag: Diagnostic = .{ .path = null };
-//     errdefer std.debug.print("diag: {f}", .{diag.fmt(case)});
-//     const ast = try Ast.init(std.testing.allocator, case, true, true, false, &diag);
-//     defer ast.deinit(std.testing.allocator);
-//     try std.testing.expectFmt(case, "{f}", .{ast});
-// }
+    const ast = try Ast.init(std.testing.allocator, case, .{});
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.fmt(case, .plain)});
+}
 
-// test "struct - basic" {
-//     const case =
-//         \\{
-//         \\    .foo = 1,
-//         \\    .bar = 2,
-//         \\    .baz = 3,
-//         \\}
-//     ;
+test "struct - basic" {
+    const case =
+        \\.{
+        \\    .foo = 1,
+        \\    .bar = 2,
+        \\    .baz = 3,
+        \\}
+        \\
+    ;
 
-//     var diag: Diagnostic = .{ .path = null };
-//     errdefer std.debug.print("diag: {f}", .{diag.fmt(case)});
-//     const ast = try Ast.init(std.testing.allocator, case, true, true, false, &diag);
-//     defer ast.deinit(std.testing.allocator);
-//     try std.testing.expectFmt(case, "{f}", .{ast});
-// }
+    const ast = try Ast.init(std.testing.allocator, case, .{});
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.fmt(case, .plain)});
+}
 
-// test "array - basic" {
-//     const case =
-//         \\[
-//         \\    1,
-//         \\    2,
-//         \\    3,
-//         \\]
-//     ;
+test "array - basic" {
+    const case =
+        \\[
+        \\    1,
+        \\    2,
+        \\    3,
+        \\]
+        \\
+    ;
 
-//     var diag: Diagnostic = .{ .path = null };
-//     errdefer std.debug.print("diag: {f}", .{diag.fmt(case)});
-//     const ast = try Ast.init(std.testing.allocator, case, true, true, false, &diag);
-//     defer ast.deinit(std.testing.allocator);
-//     try std.testing.expectFmt(case, "{f}", .{ast});
-// }
+    const ast = try Ast.init(std.testing.allocator, case, .{});
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.fmt(case, .plain)});
+}
 
-// test "braceless struct - basic" {
-//     const case =
-//         \\.foo = "hello",
-//         \\.bar = [1, 2, 3],
-//     ;
+test "braceless struct - basic" {
+    const case =
+        \\.foo = "hello",
+        \\.bar = [1, 2, 3],
+        \\
+    ;
 
-//     var diag: Diagnostic = .{ .path = null };
-//     errdefer std.debug.print("diag: {f}", .{diag.fmt(case)});
-//     const ast = try Ast.init(std.testing.allocator, case, true, true, false, &diag);
-//     defer ast.deinit(std.testing.allocator);
-//     try std.testing.expectFmt(case, "{f}", .{ast});
-// }
+    const ast = try Ast.init(std.testing.allocator, case, .{});
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.fmt(case, .plain)});
+}
 
-// test "braceless struct - vertical" {
-//     const case =
-//         \\.foo = "hello",
-//         \\.bar = [
-//         \\    1,
-//         \\    2,
-//         \\    3,
-//         \\],
-//         \\.baz = {
-//         \\    "a": 1,
-//         \\    "b": 2,
-//         \\    "c": 3,
-//         \\},
-//     ;
+test "braceless struct - vertical" {
+    const case =
+        \\.foo = "hello",
+        \\.bar = [
+        \\    1,
+        \\    2,
+        \\    3,
+        \\],
+        \\.baz = {
+        \\    "a": 1,
+        \\    "b": 2,
+        \\    "c": 3,
+        \\},
+        \\
+    ;
+    const ast = try Ast.init(std.testing.allocator, case, .{});
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.fmt(case, .plain)});
+}
 
-//     var diag: Diagnostic = .{ .path = null };
-//     errdefer std.debug.print("diag: {f}", .{diag.fmt(case)});
-//     const ast = try Ast.init(std.testing.allocator, case, true, true, false, &diag);
-//     defer ast.deinit(std.testing.allocator);
-//     try std.testing.expectFmt(case, "{f}", .{ast});
-// }
+test "braceless struct - complex" {
+    const case =
+        \\.foo = "bar",
+        \\.bar = [
+        \\    1,
+        \\    2,
+        \\    {
+        \\        "abc": "foo",
+        \\        "baz": ["foo", "bar"],
+        \\    },
+        \\    [
+        \\        123456789,
+        \\    ],
+        \\],
+        \\
+    ;
 
-// test "braceless struct - complex" {
-//     const case =
-//         \\.foo = "bar",
-//         \\.bar = [
-//         \\    1,
-//         \\    2,
-//         \\    {
-//         \\        "abc": "foo",
-//         \\        "baz": ["foo", "bar"],
-//         \\    },
-//         \\    [
-//         \\        123456789,
-//         \\    ],
-//         \\],
-//     ;
+    const ast = try Ast.init(std.testing.allocator, case, .{});
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.fmt(case, .plain)});
+}
 
-//     var diag: Diagnostic = .{ .path = null };
-//     errdefer std.debug.print("diag: {f}", .{diag.fmt(case)});
-//     const ast = try Ast.init(std.testing.allocator, case, true, true, false, &diag);
-//     defer ast.deinit(std.testing.allocator);
-//     try std.testing.expectFmt(case, "{f}", .{ast});
-// }
+test "frontmatter - complex" {
+    const case =
+        \\---
+        \\.foo = "bar",
+        \\.bar = [
+        \\    1,
+        \\    2,
+        \\    {
+        \\        "abc": "foo",
+        \\        "baz": ["foo", "bar"],
+        \\    },
+        \\    [
+        \\        123456789,
+        \\    ],
+        \\],
+        \\---
+        \\
+    ;
 
-// test "frontmatter - complex" {
-//     const case =
-//         \\---
-//         \\.foo = "bar",
-//         \\.bar = [
-//         \\    1,
-//         \\    2,
-//         \\    {
-//         \\        "abc": "foo",
-//         \\        "baz": ["foo", "bar"],
-//         \\    },
-//         \\    [
-//         \\        123456789,
-//         \\    ],
-//         \\],
-//         \\---
-//     ;
+    const ast = try Ast.init(std.testing.allocator, case, .{ .delimiter = .{ .dashes = 3 } });
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.fmt(case, .plain)});
+}
 
-//     var diag: Diagnostic = .{ .path = null };
-//     errdefer std.debug.print("diag: {f}", .{diag.fmt(case)});
-//     const ast = try Ast.init(std.testing.allocator, case, true, true, true, &diag);
-//     defer ast.deinit(std.testing.allocator);
-//     try std.testing.expectFmt(case, "{f}", .{ast});
-// }
+test "multiline in union" {
+    const case =
+        \\.foo = [
+        \\    .myunion(
+        \\        \\arstarst
+        \\        \\arstarst
+        \\        \\arstarst
+        \\    ),
+        \\],
+        \\
+    ;
+
+    const ast = try Ast.init(std.testing.allocator, case, .{});
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.fmt(case, .plain)});
+}
